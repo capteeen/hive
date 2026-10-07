@@ -107,9 +107,8 @@ export default function CombScene({
       onHover: (p) => setHover(p),
       onSelect: (p) => {
         const prev = pickKey(selRef.current);
-        if (!p) {
-          if (prev) sfx('deselect');
-        } else sfx(p.kind === 'hive' ? 'select' : 'empty');
+        if (!p) sfx(prev ? 'deselect' : 'tick');
+        else sfx(p.kind === 'hive' ? 'select' : 'empty');
         setSelRef.current(p);
       },
       onOpen: (hca) => {
@@ -193,7 +192,9 @@ export default function CombScene({
 
   // safe area (UI that covers the canvas) and selection → renderer
   const areaKey = JSON.stringify(safeArea ?? {});
-  const panelOpen = panel && comb && !!sel;
+  const worldNow = useHive.getState().world;
+  const selResolves = !!sel && (sel.kind === 'empty' || !!worldNow.hives[sel.ca]);
+  const panelOpen = panel && comb && selResolves;
   useEffect(() => {
     const r = rendererRef.current;
     if (!r || !comb) return;
@@ -216,9 +217,13 @@ export default function CombScene({
     if (zoomNext.current != null) {
       r.flyToPick(sel, zoomNext.current);
       zoomNext.current = null;
-    } else r.ensureVisible(sel);
+      return;
+    }
+    // wait out the double-click window before moving the camera under the pointer
+    const t = setTimeout(() => rendererRef.current?.ensureVisible(selRef.current), 400);
+    return () => clearTimeout(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selKey, comb]);
+  }, [selKey, comb, panelOpen]);
 
   // keyboard: Esc deselects, Enter opens the hive / starts founding on the empty cell
   useEffect(() => {
@@ -226,11 +231,12 @@ export default function CombScene({
     const onKey = (e: KeyboardEvent) => {
       if (document.querySelector('[role="dialog"]')) return; // the launch wizard owns the keyboard
       const t = e.target as HTMLElement | null;
-      if (t && t.closest('input, textarea, select, button, a, [contenteditable="true"]')) return;
+      if (t && t.closest('input, textarea, select, [contenteditable="true"]')) return;
       if (e.key === 'Escape') {
         sfx('deselect');
         setSelRef.current(null);
       } else if (e.key === 'Enter') {
+        if (t && t.closest('button, a')) return; // Enter activates the focused control
         const p = selRef.current;
         if (p?.kind === 'hive') router.push(`/hive/${p.ca}`);
         else if (p?.kind === 'empty') {
@@ -331,10 +337,7 @@ export default function CombScene({
         <CellPanel
           pick={sel}
           wide={wide}
-          onClose={() => {
-            sfx('deselect');
-            setSel(null);
-          }}
+          onClose={() => setSel(null)} // the panel's buttons play their own 'close' sound
           onPick={(p) => setSel(p)}
         />
       )}

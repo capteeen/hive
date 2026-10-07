@@ -10,7 +10,7 @@ import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
 import { theme } from '@/themes';
-import { axialToXY, ringXY, spiral, cellKey } from './hex';
+import { axialToXY, ringXY, cellKey, spiralIndexOf } from './hex';
 import { beeGeometry, wingGeometry, QueenModel } from './beeModel';
 import { pickKey, type Cell, type CombPick, type Hive, type SceneEvent } from './types';
 
@@ -29,7 +29,7 @@ const MAX_CELLS = 400;
 const MAX_BEES = 3200;
 const MAX_RINGS = 96;
 const MAX_SLOTS = 400;
-const MAX_GHOSTS = 4;
+const MAX_GHOSTS = 8;
 const MAX_BEES_PER_CELL = 30;
 const TILT = (30 * Math.PI) / 180; // from vertical
 const CELL_R = 1;
@@ -191,13 +191,9 @@ function shadowGeometry() {
   return g;
 }
 
-const spiralIndex = new Map<string, number>();
-spiral(600).forEach((c, i) => spiralIndex.set(cellKey(c), i));
-
 function layoutXZ(cell: Cell): [number, number] {
   if (theme.scene === 'den') {
-    const i = spiralIndex.get(cellKey(cell)) ?? 0;
-    const [x, y] = ringXY(i, 2.25);
+    const [x, y] = ringXY(spiralIndexOf(cell), 2.25);
     return [x, y];
   }
   const [x, y] = axialToXY(cell, CELL_R * CELL_GAP);
@@ -237,8 +233,12 @@ export class CombRenderer {
   private pointerInside = false;
   private pointerDirty = false;
   private frame = 0;
-  private down: { x: number; y: number; id: number; grab: THREE.Vector3 | null; moved: boolean } | null = null;
-  private lastClick = { key: '', time: 0 };
+  private down: { x: number; y: number; id: number; grab: THREE.Vector3 | null; moved: boolean; slop: number } | null = null;
+  private lastClick = { key: '', time: 0, x: 0, y: 0, ca: '' };
+  /** The pick a camera flight is heading to, so its goal can be recomputed when UI insets change. */
+  private flyPick: CombPick = null;
+  /** Hover only makes sense for a mouse; touch and pen never hover. */
+  private lastPointerType = 'mouse';
   private day = false;
   private ringMesh: THREE.InstancedMesh;
   private pulseMesh: THREE.InstancedMesh;
@@ -619,7 +619,14 @@ export class CombRenderer {
   /** Screen insets covered by UI. With `recenter`, snaps the comb's centre into the visible area. */
   setSafeArea(a: SafeArea, recenter = false) {
     this.safe = { ...a };
-    if (recenter && this.opts.mode === 'comb') {
+    if (this.opts.mode !== 'comb') return;
+    // a flight in progress keeps going, re-aimed for the new insets (don't cancel it with a recenter)
+    if (this.flying && this.flyPick) {
+      const pos = this.pickPos(this.flyPick);
+      if (pos) this.goal.copy(this.goalFor(pos, this.zoomGoal));
+      return;
+    }
+    if (recenter) {
       const g = this.goalFor(_v.set(0, 0, 0), this.zoom);
       this.target.copy(g);
       this.goal.copy(g);
@@ -635,6 +642,7 @@ export class CombRenderer {
     this.zoomGoal = THREE.MathUtils.clamp(zoom ?? this.zoom, 0.45, 4);
     this.goal.copy(this.goalFor(pos, this.zoomGoal));
     this.flying = true;
+    this.flyPick = p;
   }
 
   flyTo(ca: string, zoom?: number) {
@@ -643,6 +651,7 @@ export class CombRenderer {
 
   /** Pan only if the pick is off-screen or hidden under UI. Keeps the cell under the cursor otherwise. */
   ensureVisible(p: CombPick) {
+    this.updateCamera(); // the camera may not have been placed by a frame yet
     const s = this.projectPick(p);
     if (!s) return;
     const r = this.safeRect();
@@ -890,12 +899,13 @@ export class CombRenderer {
 
   /* ---------- input ---------- */
   private onPointerMove = (e: PointerEvent) => {
+    this.lastPointerType = e.pointerType || 'mouse';
     this.ndcFromClient(e.clientX, e.clientY, this.pointer);
     this.pointerInside = true;
     this.pointerDirty = true;
     const d = this.down;
     if (!d || d.id !== e.pointerId || !this.interactive()) return;
-    if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 5) {
+    if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) > d.slop) {
       d.moved = true;
       if (this.hoverPick) {
         this.hoverPick = null;
@@ -917,10 +927,19 @@ export class CombRenderer {
   private onPointerDown = (e: PointerEvent) => {
     if (!this.interactive()) return;
     if (e.pointerType === 'mouse' && e.button !== 0) return;
+    this.lastPointerType = e.pointerType || 'mouse';
     this.ndcFromClient(e.clientX, e.clientY, this.pointer);
     this.pointerInside = true;
     this.pointerDirty = true;
-    this.down = { x: e.clientX, y: e.clientY, id: e.pointerId, grab: this.groundAt(this.pointer), moved: false };
+    // grabbing the comb stops any camera flight, so the drag starts from where the view is now
+    this.flying = false;
+    this.flyPick = null;
+    this.goal.copy(this.target);
+    this.zoomGoal = this.zoom;
+    this.updateCamera();
+    // fingers drift: a touch or pen tap may move a little before it counts as a pan
+    const slop = e.pointerType === 'mouse' ? 5 : 12;
+    this.down = { x: e.clientX, y: e.clientY, id: e.pointerId, grab: this.groundAt(this.pointer), moved: false, slop };
     if (e.pointerType === 'mouse') this.canvas.setPointerCapture?.(e.pointerId);
   };
   private onPointerUp = (e: PointerEvent) => {
@@ -933,15 +952,17 @@ export class CombRenderer {
       return;
     }
     // pick at the release point (touch has no hover, so never rely on the hover state)
-    const p = this.pickNdc(this.ndcFromClient(e.clientX, e.clientY, _ndc));
-    const key = pickKey(p);
     const now = performance.now();
-    if (p?.kind === 'hive' && this.lastClick.key === key && now - this.lastClick.time < 380) {
-      this.lastClick = { key: '', time: 0 };
-      this.opts.onOpen?.(p.ca);
+    // double-click: judged against the first click's position, because the first click may have
+    // opened the panel or started a camera move that changes what is under the pointer
+    const lc = this.lastClick;
+    if (lc.ca && now - lc.time < 380 && Math.hypot(e.clientX - lc.x, e.clientY - lc.y) < 10) {
+      this.lastClick = { key: '', time: 0, x: 0, y: 0, ca: '' };
+      this.opts.onOpen?.(lc.ca);
       return;
     }
-    this.lastClick = { key, time: now };
+    const p = this.pickNdc(this.ndcFromClient(e.clientX, e.clientY, _ndc));
+    this.lastClick = { key: pickKey(p), time: now, x: e.clientX, y: e.clientY, ca: p?.kind === 'hive' ? p.ca : '' };
     this.opts.onSelect?.(p);
   };
   private onPointerCancel = () => {
@@ -977,7 +998,11 @@ export class CombRenderer {
       return; // let the page scroll
     }
     e.preventDefault();
-    this.zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0012)));
+    const dy = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaMode === 2 ? e.deltaY * this.height : e.deltaY;
+    // trackpad pinch arrives as ctrl+wheel with small deltas; a real wheel notch is ~100
+    const pinch = e.ctrlKey && e.deltaMode === 0 && Math.abs(dy) < 50;
+    const f = Math.exp(-dy * (pinch ? 0.01 : 0.0012));
+    this.zoomAt(e.clientX, e.clientY, THREE.MathUtils.clamp(f, 0.8, 1.25));
   };
   private onTouchStart = (e: TouchEvent) => {
     if (e.touches.length === 2) {
@@ -1149,13 +1174,20 @@ export class CombRenderer {
       const kf = 1 - Math.exp(-dt * 2.2);
       this.target.lerp(this.goal, kf);
       this.zoom += (this.zoomGoal - this.zoom) * kf;
-      if (this.target.distanceTo(this.goal) < 0.02 && Math.abs(this.zoom - this.zoomGoal) < 0.005) this.flying = false;
+      if (this.target.distanceTo(this.goal) < 0.02 && Math.abs(this.zoom - this.zoomGoal) < 0.005) {
+        this.flying = false;
+        this.flyPick = null;
+      }
     }
     this.updateCamera();
 
     // hover: re-pick when the pointer moved, and every few frames (cells lift and move)
     this.frame++;
-    if (this.interactive() && this.pointerInside && !this.down?.moved && (this.pointerDirty || this.frame % 6 === 0)) {
+    if (this.lastPointerType !== 'mouse' && this.hoverPick) {
+      this.hoverPick = null;
+      this.opts.onHover?.(null);
+    }
+    if (this.interactive() && this.lastPointerType === 'mouse' && this.pointerInside && !this.down?.moved && (this.pointerDirty || this.frame % 6 === 0)) {
       this.pointerDirty = false;
       const p = this.pickNdc(this.pointer);
       if (pickKey(p) !== pickKey(this.hoverPick)) {
@@ -1354,7 +1386,7 @@ export class CombRenderer {
     const plateHot = this.day ? this.palette.soft.clone().lerp(new THREE.Color(theme.palette.dayBase), 0.35) : this.palette.accent.clone().multiplyScalar(0.42);
     const rimBase = this.palette.accent.clone().multiplyScalar(this.day ? 0.6 : 0.3);
     const rimHot = this.day ? this.palette.accent : this.palette.soft;
-    let ghostN = 0;
+    const ghosts: { amt: number; prio: number; x: number; z: number; g: number; gh: number }[] = [];
     const nSlots = Math.min(this.slots.length, MAX_SLOTS);
     for (let i = 0; i < nSlots; i++) {
       const sl = this.slots[i];
@@ -1378,11 +1410,7 @@ export class CombRenderer {
       this.slotRim.setColorAt(i, _c);
       // ghost cell: a translucent wax preview of the hive that could live here
       const gh = 0.06 + 0.5 * amt + (isSel ? Math.sin(t * 2.4) * 0.03 : 0);
-      if (amt > 0.02 && ghostN < MAX_GHOSTS) {
-        _s.set(g * (0.92 + 0.08 * amt), gh, g * (0.92 + 0.08 * amt));
-        _m.compose(_p, _q, _s);
-        this.ghostMesh.setMatrixAt(ghostN++, _m);
-      }
+      if (amt > 0.02) ghosts.push({ amt, prio: isSel ? 2 : sl.key === hoverSlot ? 1 : 0, x: sl.pos.x, z: sl.pos.z, g, gh });
       if (isSel) {
         ringOn = true;
         ringScale = g;
@@ -1395,6 +1423,16 @@ export class CombRenderer {
           this.writeBee(sl.pos.x + b.x, by, sl.pos.z + b.z, b.heading, Math.min(0.35, Math.hypot(b.vx, b.vz) * 0.3), Math.sin(t * 2.2 + b.phase) * 0.08, b.scale * Math.min(1, (t - b.born) * 1.5), 1, this.palette.worker, gh, t, b.phase);
         }
       }
+    }
+    ghosts.sort((a, b) => b.prio - a.prio || b.amt - a.amt);
+    const ghostN = Math.min(ghosts.length, MAX_GHOSTS);
+    _q.identity();
+    for (let gi = 0; gi < ghostN; gi++) {
+      const gs = ghosts[gi];
+      _p.set(gs.x, 0, gs.z);
+      _s.set(gs.g * (0.92 + 0.08 * gs.amt), gs.gh, gs.g * (0.92 + 0.08 * gs.amt));
+      _m.compose(_p, _q, _s);
+      this.ghostMesh.setMatrixAt(gi, _m);
     }
     this.slotPlate.count = nSlots;
     this.slotRim.count = nSlots;

@@ -82,7 +82,7 @@ export const RULE_LIMITS = {
   sealTrigger: { min: 0, max: 0.2, step: 0.01 },
   interactThreshold: { min: 1.2, max: 6, step: 0.1 },
   interactShare: { min: 0.05, max: 0.5, step: 0.05 },
-  cooldownH: { min: 0.5, max: 6, step: 0.5 },
+  cooldownH: { min: 0.5, max: 6, step: 0.25 },
 } as const;
 
 export function clampRules(r: Partial<QueenRules>): QueenRules {
@@ -96,19 +96,24 @@ export function clampRules(r: Partial<QueenRules>): QueenRules {
 
 export type Risk = 'low' | 'medium' | 'high' | 'extreme';
 
+const capWord = (s: string) => s[0].toUpperCase() + s.slice(1);
+const BURN = capWord(theme.verbs.burn);
+const HIT = theme.verbs.interact;
+const HITS = capWord(theme.verbs.interact);
+
 /** What she does in a dip. */
 export const DIPS = [
-  { id: 'gentle', name: 'Gentle', icon: '◇', body: `Seals lightly. In a real dip (3% under the 24h average) she burns 25% of the hour's fees and stores the rest.`, rules: { burnShare: 0.25, sealTrigger: 0.03 } },
+  { id: 'gentle', name: 'Gentle', icon: '◇', body: `${BURN}s lightly. In a real dip (3% under the 24h average) she burns 25% of the hour's fees and stores the rest.`, rules: { burnShare: 0.25, sealTrigger: 0.03 } },
   { id: 'steady', name: 'Steady', icon: '◆', body: `The default. Any dip under the 24h average: 40% of the hour's fees buy and burn, 60% stored as ${theme.copy.resource}.`, rules: { burnShare: 0.4, sealTrigger: 0 } },
   { id: 'fierce', name: 'Fierce', icon: '✦', body: `Defends the price. Any dip: 65% of the hour's fees buy and burn. Less ${theme.copy.resource}, more ${theme.verbs.burn}s.`, rules: { burnShare: 0.65, sealTrigger: 0 } },
 ] as const;
 
 /** How she swarms. */
 export const SWARMS = [
-  { id: 'homebody', name: 'Homebody', risk: 'low' as Risk, body: `Rarely leaves. Swarms only when ${theme.copy.resource} is 4× her hourly fees, with 10% of it.`, rules: { interactThreshold: 4, interactShare: 0.1, cooldownH: 3 } },
-  { id: 'forager', name: 'Forager', risk: 'medium' as Risk, body: 'Balanced all-rounder: swarms at 2× her hourly fees with 25%. The default.', rules: { interactThreshold: 2, interactShare: 0.25, cooldownH: 1 } },
-  { id: 'raider', name: 'Raider', risk: 'high' as Risk, body: 'Momentum: swarms at 1.5× with 35%, every 45 minutes if she can. Hits the fastest-growing neighbour hard.', rules: { interactThreshold: 1.5, interactShare: 0.35, cooldownH: 0.75 } },
-  { id: 'berserker', name: 'Berserker', risk: 'extreme' as Risk, body: `Swarms at 1.2× with half her ${theme.copy.resource}. EXTREME RISK: her vault can drain fast.`, rules: { interactThreshold: 1.2, interactShare: 0.5, cooldownH: 0.5 } },
+  { id: 'homebody', name: 'Homebody', risk: 'low' as Risk, body: `Rarely leaves. ${HITS}s only when ${theme.copy.resource} is 4× her hourly fees, with 10% of it.`, rules: { interactThreshold: 4, interactShare: 0.1, cooldownH: 3 } },
+  { id: 'forager', name: 'Forager', risk: 'medium' as Risk, body: `Balanced all-rounder: ${HIT}s at 2× her hourly fees with 25%. The default.`, rules: { interactThreshold: 2, interactShare: 0.25, cooldownH: 1 } },
+  { id: 'raider', name: 'Raider', risk: 'high' as Risk, body: `Momentum: ${HIT}s at 1.5× with 35%, at most every 45 minutes. Hits the fastest-growing neighbour hard.`, rules: { interactThreshold: 1.5, interactShare: 0.35, cooldownH: 0.75 } },
+  { id: 'berserker', name: 'Berserker', risk: 'extreme' as Risk, body: `${HITS}s at 1.2× with half her ${theme.copy.resource}. EXTREME RISK: her vault can drain fast.`, rules: { interactThreshold: 1.2, interactShare: 0.5, cooldownH: 0.5 } },
 ] as const;
 
 export type DipId = (typeof DIPS)[number]['id'];

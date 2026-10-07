@@ -63,7 +63,8 @@ export default function CombExplorer() {
   const onSel = useCallback(
     (p: CombPick) => {
       setSel(p);
-      if (!p && focusCa) router.replace('/comb', { scroll: false });
+      // once the selection moves away from the linked hive, drop ?focus= so a remount doesn't jump back
+      if (focusCa && !(p?.kind === 'hive' && p.ca === focusCa)) router.replace('/comb', { scroll: false });
     },
     [focusCa, router],
   );

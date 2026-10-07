@@ -130,10 +130,11 @@ export function crownGeometry(look: QueenLook): THREE.BufferGeometry | null {
   return mergeGeometries(parts.map((p) => (p.index ? p.toNonIndexed() : p)))!;
 }
 
-/** A soft radial sprite texture used for glows. */
-let glowTex: THREE.CanvasTexture | null = null;
+/**
+ * A soft radial sprite texture used for glows. Each caller owns (and must dispose) its texture:
+ * a shared texture would keep every WebGL renderer that ever uploaded it alive via its dispose listener.
+ */
 export function glowTexture() {
-  if (glowTex) return glowTex;
   const c = document.createElement('canvas');
   c.width = c.height = 128;
   const g = c.getContext('2d')!;
@@ -143,8 +144,7 @@ export function glowTexture() {
   r.addColorStop(1, 'rgba(255,255,255,0)');
   g.fillStyle = r;
   g.fillRect(0, 0, 128, 128);
-  glowTex = new THREE.CanvasTexture(c);
-  return glowTex;
+  return new THREE.CanvasTexture(c);
 }
 
 /** A complete queen: body, wings, crown and glow. Call `animate` each frame. */
@@ -154,6 +154,7 @@ export class QueenModel {
   private wings: THREE.Mesh<THREE.BufferGeometry, THREE.MeshPhysicalMaterial>;
   private crown: THREE.Mesh<THREE.BufferGeometry, THREE.MeshStandardMaterial> | null = null;
   private glow: THREE.Sprite;
+  private glowMap: THREE.CanvasTexture;
   private key = '';
 
   constructor(look: QueenLook, opts: { glowSize?: number } = {}) {
@@ -162,7 +163,8 @@ export class QueenModel {
       wingGeometry(),
       new THREE.MeshPhysicalMaterial({ color: new THREE.Color(look.wings), transparent: true, opacity: 0.4, roughness: 0.15, metalness: 0.2, side: THREE.DoubleSide, depthWrite: false }),
     );
-    this.glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture(), color: new THREE.Color(look.glow), transparent: true, opacity: 0.55, depthWrite: false, blending: THREE.AdditiveBlending }));
+    this.glowMap = glowTexture();
+    this.glow = new THREE.Sprite(new THREE.SpriteMaterial({ map: this.glowMap, color: new THREE.Color(look.glow), transparent: true, opacity: 0.55, depthWrite: false, blending: THREE.AdditiveBlending }));
     const gs = opts.glowSize ?? 0.55;
     this.glow.scale.set(gs, gs, gs);
     this.group.add(this.glow, this.body, this.wings);
@@ -203,6 +205,7 @@ export class QueenModel {
     this.wings.geometry.dispose();
     this.wings.material.dispose();
     this.glow.material.dispose();
+    this.glowMap.dispose();
     if (this.crown) {
       this.crown.geometry.dispose();
       this.crown.material.dispose();

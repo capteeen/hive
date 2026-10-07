@@ -4,15 +4,13 @@ import 'server-only';
  * same spiral of cells in every browser, so the server treats them as taken too.
  */
 import { demoCells } from '@/lib/sim';
-import { cellKey, hexDistance, neighbors, spiral } from '@/lib/hex';
+import { cellKey, hexDistance, neighbors, spiralIndexOf } from '@/lib/hex';
 import type { Cell } from '@/lib/types';
 import type { Db } from './db';
 import { config } from './config';
 
 const ORIGIN: Cell = { q: 0, r: 0 };
-const spiralIndex = new Map<string, number>();
-spiral(1200).forEach((c, i) => spiralIndex.set(cellKey(c), i));
-const order = (c: Cell) => spiralIndex.get(cellKey(c)) ?? 1e9;
+const order = (c: Cell) => spiralIndexOf(c);
 
 /** Free edge cells, best first: the preferred cell, then nearest to it, then spiral order. */
 export async function candidateCells(db: Db, preferred: Cell | null, now: number, limit = 40): Promise<Cell[]> {

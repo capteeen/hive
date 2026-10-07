@@ -48,6 +48,35 @@ export function spiral(count: number): Cell[] {
 
 export const cellKey = (c: Cell) => `${c.q},${c.r}`;
 
+const spiralMemo = new Map<string, number>();
+/** Index of `c` in spiral() order, for any cell (walks its ring once, memoised). */
+export function spiralIndexOf(c: Cell): number {
+  const k = cellKey(c);
+  const hit = spiralMemo.get(k);
+  if (hit !== undefined) return hit;
+  const ring = hexDistance(c, { q: 0, r: 0 });
+  let idx = 0;
+  if (ring > 0) {
+    let q = -ring;
+    let r = ring;
+    let i = 1 + 3 * ring * (ring - 1);
+    outer: for (let side = 0; side < 6; side++) {
+      for (let step = 0; step < ring; step++) {
+        if (q === c.q && r === c.r) {
+          idx = i;
+          break outer;
+        }
+        q += DIRS[side].q;
+        r += DIRS[side].r;
+        i++;
+      }
+    }
+  }
+  if (spiralMemo.size > 20000) spiralMemo.clear();
+  spiralMemo.set(k, idx);
+  return idx;
+}
+
 /** Circular ring layout for the 'den' scene: index → xy on concentric rings. */
 export function ringXY(index: number, spacing = 2.1): [number, number] {
   if (index === 0) return [0, 0];

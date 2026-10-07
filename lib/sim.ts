@@ -353,7 +353,8 @@ export function earnFees(world: World, h: Hive, amount: number, now: number, rng
       target.swarmsIn++;
       if (h.honey > target.honey) h.swarmsWon++;
       else target.swarmsWon++;
-      swarmCooldown.set(h.ca, now + HOUR_MS * rules.cooldownH * (0.4 + rng() * 0.6));
+      // the published cooldown is a minimum gap between swarms; jitter only lengthens it
+      swarmCooldown.set(h.ca, now + HOUR_MS * rules.cooldownH * (1 + rng() * 0.25));
       target.price *= 1 + Math.min(0.12, spend * 0.02);
       pushPrice(target, now);
       pushAction(world, {

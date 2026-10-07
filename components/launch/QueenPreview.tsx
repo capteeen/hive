@@ -115,6 +115,7 @@ export default function QueenPreview({ look, className = '', speaking }: { look:
         }
       });
       renderer.dispose();
+      renderer.forceContextLoss(); // dispose() alone keeps the WebGL context alive
       modelRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
