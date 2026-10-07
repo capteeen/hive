@@ -1,5 +1,6 @@
 import { errorResponse, okJson, readJson, refundLaunch } from '@/lib/server/launch';
 import { clientIp } from '@/lib/server/ratelimit';
+import { publicStatus } from '@/app/api/_lib/public';
 
 /**
  * POST /api/launch/[id]/refund — return the queen wallet's SOL to the owner for a failed launch
@@ -13,7 +14,7 @@ export const maxDuration = 60;
 export async function POST(req: Request, { params }: { params: { id: string } }) {
   try {
     const body = await readJson(req);
-    return okJson(await refundLaunch(params.id, body, { ip: clientIp(req.headers) }));
+    return okJson(publicStatus(await refundLaunch(params.id, body, { ip: clientIp(req.headers) })));
   } catch (e) {
     return errorResponse(e);
   }

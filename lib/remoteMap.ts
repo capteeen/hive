@@ -1,6 +1,6 @@
 /** Convert server-side (remote) records into the client's world model. */
 import type { Hive, Action, Harvest } from './types';
-import type { RemoteAction, RemoteHarvest, RemoteHive } from './shared/api';
+import type { LaunchMode, RemoteAction, RemoteHarvest, RemoteHive } from './shared/api';
 
 export function remoteToHive(r: RemoteHive, prev?: Hive): Hive {
   const price = r.price ?? prev?.price ?? 0;
@@ -47,4 +47,15 @@ export function remoteToHive(r: RemoteHive, prev?: Hive): Hive {
 
 export const remoteToAction = (a: RemoteAction): Action => ({ id: a.id, ca: a.ca, verb: a.verb, amount: a.amount, targetCa: a.targetCa, reason: a.dryRun ? `[dry run] ${a.reason}` : a.reason, txSig: a.dryRun ? undefined : a.txSig, at: a.at });
 
-export const remoteToHarvest = (h: RemoteHarvest): Harvest => ({ id: h.id, at: h.at, feesIn: h.feesIn, hiveBought: h.hiveBought, burned: h.burned, jellyTo: h.jellyTo, jellyAmount: h.jellyAmount, jellySol: h.jellySol, txSig: h.dryRun ? '' : h.txSig, dryRun: h.dryRun });
+/** A harvest recorded by the server, as opposed to one the browser's demo simulator made up. */
+export type ServerHarvest = Harvest & { source: 'remote' };
+
+export const remoteToHarvest = (h: RemoteHarvest): ServerHarvest => ({ id: h.id, at: h.at, feesIn: h.feesIn, hiveBought: h.hiveBought, burned: h.burned, jellyTo: h.jellyTo, jellyAmount: h.jellyAmount, jellySol: h.jellySol, txSig: h.dryRun ? '' : h.txSig, dryRun: h.dryRun, source: 'remote' });
+
+export const isServerHarvest = (h: Harvest): h is ServerHarvest => (h as Partial<ServerHarvest>).source === 'remote';
+
+/**
+ * Whether a harvest's tx is a real transaction worth linking: only one the server sent in live launch
+ * mode. Demo harvests carry made-up signatures, and mock-mode server harvests carry MockChain ones.
+ */
+export const harvestOnChain = (h: Harvest, launchMode: LaunchMode | null | undefined) => launchMode === 'live' && isServerHarvest(h) && !h.dryRun && !!h.txSig;

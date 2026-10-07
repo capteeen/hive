@@ -4,8 +4,13 @@ import 'server-only';
  * cache loaded once, and an in-process event bus that feeds the SSE endpoint.
  *
  * Layout (all files written atomically: tmp file + fsync + rename, mode 0600):
- *   hives/<ca>.json        one RemoteHive per file (hives carry images, so they are written one by one)
- *   launches/<id>.json     one LaunchRecord per file (payload carries the image)
+ *   hives/<ca>.json        one RemoteHive per file
+ *   images/<ca>.json       { ca, image }: a hive's data-URL image, read from disk on demand (never cached).
+ *                          The hive itself carries `/api/hives/<ca>/image?v=…` instead, so lists, the
+ *                          change feed and memory never hold image bytes. Exposed as meta `image:<ca>`
+ *                          (the same key SupabaseDb uses).
+ *   launches/<id>.json     one LaunchRecord per file (payload carries the image until the launch is
+ *                          live or refunded; then the image is dropped, the hive has its own copy)
  *   prices/<ca>.json       { ca, points } per hive, newest 2000 points, loaded lazily (cached for
  *                          real hives only, so unknown CAs never grow memory)
  *   actions.json           newest 5000, newest first
@@ -29,6 +34,7 @@ import path from 'node:path';
 import { createHash, randomBytes } from 'node:crypto';
 import type { Cell } from '@/lib/types';
 import type { LaunchState, RemoteAction, RemoteHarvest, RemoteHive, StreamEvent } from '@/lib/shared/api';
+import { hiveImageMetaKey, hiveImagePath, isDataUrl } from '@/lib/shared/rows';
 import type { Db, LaunchRecord } from './db';
 
 /** Retention caps (the UI only ever shows the newest slice). */
@@ -78,6 +84,14 @@ interface Tx {
 
 const noop = () => {};
 const clone = <T>(v: T): T => structuredClone(v);
+const IMAGE_META_PREFIX = hiveImageMetaKey('');
+/**
+ * Launch states after which the payload image is never read again: a live hive keeps its own copy,
+ * and an expired launch can only be refunded (a late payment is recorded for the refund, never revived).
+ */
+const IMAGE_DONE: readonly LaunchState[] = ['live', 'expired', 'refunded'];
+/** A launch as the cache keeps it: no payload image once it can no longer be needed. */
+const slimLaunch = (l: LaunchRecord): LaunchRecord => (IMAGE_DONE.includes(l.state) && l.payload?.image ? { ...l, payload: { ...l.payload, image: '' } } : l);
 const isCellInt = (c: unknown): c is Cell => !!c && typeof c === 'object' && Number.isInteger((c as Cell).q) && Number.isInteger((c as Cell).r);
 const sameCell = (a: Cell, b: Cell) => a.q === b.q && a.r === b.r;
 
@@ -147,7 +161,7 @@ const registry = globalThis as unknown as { __hiveFileDbV1?: Map<string, State> 
 
 function newState(dir: string): State {
   const emitter = new EventEmitter();
-  emitter.setMaxListeners(0); // one listener per open SSE connection
+  emitter.setMaxListeners(0); // the SSE route subscribes once per process; tests and tools may add more
   return {
     dir,
     hives: new Map(),
@@ -202,11 +216,12 @@ export class FileDb implements Db {
 
   private async load() {
     const s = this.s;
-    for (const sub of ['', 'hives', 'launches', 'prices']) await fs.mkdir(path.join(s.dir, sub), { recursive: true, mode: 0o700 });
+    for (const sub of ['', 'hives', 'images', 'launches', 'prices']) await fs.mkdir(path.join(s.dir, sub), { recursive: true, mode: 0o700 });
     const hives = await readDir<RemoteHive>(path.join(s.dir, 'hives'));
     for (const h of hives) if (h && typeof h.ca === 'string') s.hives.set(h.ca, h);
     const launches = await readDir<LaunchRecord>(path.join(s.dir, 'launches'));
-    for (const l of launches) if (l && typeof l.id === 'string') s.launches.set(l.id, l);
+    // finished launches lose their payload image in memory (the file keeps it until it is next written)
+    for (const l of launches) if (l && typeof l.id === 'string') s.launches.set(l.id, slimLaunch(l));
     s.actions = await readJson<RemoteAction[]>(this.file('actions.json'), []);
     s.harvests = await readJson<RemoteHarvest[]>(this.file('harvests.json'), []);
     s.claims = await readJson<Claim[]>(this.file('claims.json'), []);
@@ -217,6 +232,16 @@ export class FileDb implements Db {
 
   private file(rel: string) {
     return path.join(this.s.dir, rel);
+  }
+
+  private imageFile(ca: string) {
+    return this.file(`images/${fileKey(ca)}.json`);
+  }
+
+  /** A hive's stored data-URL image, straight from disk (images are never cached in memory). */
+  private async readImage(ca: string): Promise<string | null> {
+    const data = await readJson<{ ca: string; image: string } | null>(this.imageFile(ca), null);
+    return data && data.ca === ca && typeof data.image === 'string' ? data.image : null;
   }
 
   /** Read one CA's price file from disk (missing -> []). Does not touch the cache. */
@@ -315,7 +340,10 @@ export class FileDb implements Db {
     if (!h || typeof h.ca !== 'string' || !h.ca) throw new Error('upsertHive: missing ca.');
     if (!isCellInt(h.cell)) throw new Error('upsertHive: invalid cell.');
     const next = clone(h);
-    await this.tx((t) => {
+    // A data-URL image is stored on its own and the hive points at the image route (hashed once, here).
+    const image = isDataUrl(next.image) ? next.image : null;
+    if (image) next.image = hiveImagePath(next.ca, image);
+    await this.tx(async (t) => {
       const s = this.s;
       for (const other of s.hives.values()) {
         if (other.ca === next.ca) continue;
@@ -323,6 +351,9 @@ export class FileDb implements Db {
         if (next.queenWallet && other.queenWallet === next.queenWallet) throw new Error('upsertHive: queen wallet already belongs to another hive.');
       }
       const prev = s.hives.get(next.ca);
+      // The image file goes first (inside the queue): a hive on disk never points at an image that is not.
+      // Same path = same content hash = already stored.
+      if (image && prev?.image !== next.image) await atomicWrite(this.imageFile(next.ca), JSON.stringify({ ca: next.ca, image }));
       if (prev && JSON.stringify(prev) === JSON.stringify(next)) return; // nothing changed: no write, no event
       s.hives.set(next.ca, next);
       t.save(`hives/${fileKey(next.ca)}.json`, () => s.hives.get(next.ca));
@@ -444,7 +475,7 @@ export class FileDb implements Db {
 
   async createLaunch(l: LaunchRecord): Promise<void> {
     if (!l || typeof l.id !== 'string' || !l.id) throw new Error('createLaunch: missing id.');
-    const rec = clone(l);
+    const rec = slimLaunch(clone(l));
     await this.tx((t) => {
       const s = this.s;
       if (s.launches.has(rec.id)) throw new Error(`createLaunch: launch ${rec.id} already exists.`);
@@ -466,7 +497,7 @@ export class FileDb implements Db {
       const cur = s.launches.get(id);
       if (!cur || !expect.includes(cur.state)) return null;
       // shallow merge (like a column update); a key set to undefined clears that field
-      const next: LaunchRecord = { ...cur, ...p, id: cur.id, updatedAt: p.updatedAt ?? Date.now() };
+      const next = slimLaunch({ ...cur, ...p, id: cur.id, updatedAt: p.updatedAt ?? Date.now() });
       s.launches.set(id, next);
       t.save(`launches/${fileKey(id)}.json`, () => s.launches.get(id));
       return clone(next);
@@ -499,10 +530,16 @@ export class FileDb implements Db {
 
   async getMeta(key: string): Promise<string | null> {
     await this.ready();
+    if (key.startsWith(IMAGE_META_PREFIX)) return this.readImage(key.slice(IMAGE_META_PREFIX.length));
     return Object.prototype.hasOwnProperty.call(this.s.meta, key) ? this.s.meta[key] : null;
   }
 
   async setMeta(key: string, value: string): Promise<void> {
+    if (key.startsWith(IMAGE_META_PREFIX)) {
+      const ca = key.slice(IMAGE_META_PREFIX.length);
+      await this.tx(() => atomicWrite(this.imageFile(ca), JSON.stringify({ ca, image: value })));
+      return;
+    }
     await this.tx((t) => {
       const s = this.s;
       if (s.meta[key] === value) return;

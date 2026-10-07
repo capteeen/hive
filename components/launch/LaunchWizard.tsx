@@ -476,7 +476,14 @@ export default function LaunchWizard() {
 
   // A launch started earlier in this browser: show where it is and carry on.
   useEffect(() => {
-    if (!open || run || busy || resuming.current) return;
+    if (!open || busy || resuming.current) return;
+    if (run) {
+      // Reopened over a run nothing is following any more (its polling gave up while the tab slept or
+      // was offline) and that does not need the user: check on it again. Confirm is idempotent.
+      const idle = !!run.pending && run.phase === 'confirm' && !run.error && !run.canPay && !(run.status && needsAction(run.status));
+      if (idle) void retry();
+      return;
+    }
     const p = loadPending();
     if (!p) return;
     resuming.current = true;

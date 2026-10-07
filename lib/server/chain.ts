@@ -41,8 +41,12 @@ export interface Chain {
   burn(input: { owner: Keypair; mint: string; amount: bigint }): Promise<{ signature: string }>;
   /** Current price in SOL per token (and whether the bonding curve completed). */
   coinInfo(mint: string): Promise<{ priceSol: number; marketCapSol?: number; complete?: boolean } | null>;
-  /** Holder count (needs HELIUS_API_KEY in live mode). Null when unknown. */
-  holders(mint: string): Promise<{ count: number; top: { owner: string; amount: bigint }[] } | null>;
+  /**
+   * Holder count (needs HELIUS_API_KEY in live mode). Null when unknown. `top` lists holders by amount,
+   * largest first: every holder when `top.length === count` (what an abandon payout needs). `complete:
+   * false` means the chain could not list them all (`count` is then a lower bound).
+   */
+  holders(mint: string): Promise<{ count: number; top: { owner: string; amount: bigint }[]; complete?: boolean } | null>;
   /**
    * Whether an account exists on chain (confirmed). The launch flow uses it on the mint before
    * re-sending a `create`, so a retry after a lost response never creates twice. Every chain that

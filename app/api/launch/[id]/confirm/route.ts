@@ -1,5 +1,6 @@
 import { confirmLaunch, errorResponse, okJson, readJson } from '@/lib/server/launch';
 import { clientIp } from '@/lib/server/ratelimit';
+import { publicStatus } from '@/app/api/_lib/public';
 
 /**
  * POST /api/launch/[id]/confirm — advance a launch as far as it can go: verify the payment (live,
@@ -13,7 +14,7 @@ export const maxDuration = 60;
 export async function POST(req: Request, { params }: { params: { id: string } }) {
   try {
     const body = await readJson(req);
-    return okJson(await confirmLaunch(params.id, body, { ip: clientIp(req.headers) }));
+    return okJson(publicStatus(await confirmLaunch(params.id, body, { ip: clientIp(req.headers) })));
   } catch (e) {
     return errorResponse(e);
   }

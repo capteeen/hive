@@ -88,6 +88,35 @@ export interface HiveDetailResponse {
   serverTime: number;
 }
 
+/* ---------- hive images ---------- */
+
+/**
+ * Hive images that are data URLs (mock launches, up to a few hundred KB) never travel inside list,
+ * stream or Realtime payloads. Both stores keep the data URL under the meta key `image:<ca>` and put
+ * `hiveImagePath(ca, dataUrl)` in the hive's `image` field; GET /api/hives/<ca>/image serves the bytes.
+ * `v` changes whenever the image does, so the route can be cached for good.
+ */
+export const hiveImageMetaKey = (ca: string) => `image:${ca}`;
+
+export const isDataUrl = (s: unknown): s is string => typeof s === 'string' && s.startsWith('data:');
+
+/** Short content hash for cache busting (cyrb53, base36). Not cryptographic; ~1 ms for 500 KB. */
+export function imageVersion(s: string): string {
+  let h1 = 0xdeadbeef ^ s.length;
+  let h2 = 0x41c6ce57 ^ s.length;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 2654435761);
+    h2 = Math.imul(h2 ^ c, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36);
+}
+
+/** The URL path that serves a hive's data-URL image. */
+export const hiveImagePath = (ca: string, dataUrl: string) => `/api/hives/${encodeURIComponent(ca)}/image?v=${imageVersion(dataUrl)}`;
+
 /* ---------- scalar helpers ---------- */
 
 /** Finite number from a number / numeric string; `dflt` otherwise. */
@@ -169,7 +198,8 @@ export function hiveToRow(h: RemoteHive): HiveRow {
 /**
  * Row -> RemoteHive. Returns null for rows missing the identity fields (e.g. a Realtime UPDATE whose
  * payload was cut down). `image` may legitimately be empty when Realtime drops oversized values; the
- * browser fills it from the hive it already has.
+ * browser fills it from the hive it already has. SupabaseDb stores data-URL images in `meta` and
+ * writes `hiveImagePath(...)` here, so new rows carry a short URL path.
  */
 export function rowToHive(row: unknown): RemoteHive | null {
   const r = obj<Partial<Record<keyof HiveRow, unknown>>>(row);

@@ -1,8 +1,9 @@
 import { NextResponse } from 'next/server';
 import { getDb } from '@/lib/server/db';
 import type { HiveDetailResponse } from '@/lib/shared/rows';
+import { publicHive } from '@/app/api/_lib/public';
 
-/** GET /api/hives/[ca]: one hive, its newest 100 actions and its last 24h of price snapshots. */
+/** GET /api/hives/[ca]: one hive (image as a URL, never inlined), its newest 100 actions and its last 24h of price snapshots. */
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
@@ -22,7 +23,7 @@ export async function GET(_req: Request, { params }: { params: { ca: string } })
     const hive = await db.getHive(ca);
     if (!hive) return NextResponse.json({ error: 'Hive not found.' }, { status: 404, headers: NO_STORE });
     const [actions, prices] = await Promise.all([db.listActions(100, ca), db.listPrices(ca, now - DAY_MS)]);
-    const body: HiveDetailResponse = { hive, actions, prices, serverTime: now };
+    const body: HiveDetailResponse = { hive: publicHive(hive), actions, prices, serverTime: now };
     return NextResponse.json(body, { headers: NO_STORE });
   } catch (e) {
     console.error('[hive] GET /api/hives/[ca] failed:', e instanceof Error ? e.message : e);

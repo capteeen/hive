@@ -64,8 +64,18 @@ export const HUB_RESERVE_SOL = 0.01;
 export const MIN_HARVEST_SOL = 0.001;
 /** Smallest abandon payout per holder: above the rent-exempt minimum of an empty account (0.00089 SOL). */
 export const MIN_PAYOUT_LAMPORTS = 1_000_000;
-/** Most holders one abandon payout pays. Bigger lists are recorded but not paid automatically. */
+/**
+ * Most holders one abandon payout pays (one transfer each, within the run's time budget). With more
+ * holder wallets than this, the vault goes pro-rata to the MAX_PAYOUT_RECIPIENTS biggest of them and
+ * smaller holders get nothing.
+ */
 export const MAX_PAYOUT_RECIPIENTS = 100;
+/**
+ * How long after a harvest burn or royal-jelly transfer with an unknown outcome (it timed out, or its
+ * run died) before it may be sent again: it was sent within its run (≤ 300 s) and can land until its
+ * blockhash expires (~90 s later); until then the balance is not final.
+ */
+export const UNSURE_SEND_SETTLE_MS = 10 * 60 * 1000;
 /** A buy that has not shown up in the balance after this many hours never will (its blockhash expired). */
 const PENDING_GIVE_UP_HOURS = 2;
 /** Time budget of one engine run: the cron route's maxDuration (300 s) minus room to record and answer. */
@@ -95,6 +105,8 @@ export const ENGINE_META = {
   /** Set (to an expiry time) while the hourly run or the harvest writes hive rows; the refresh stays off them. */
   busy: (mode: LaunchMode, job: 'hourly' | 'harvest') => `engine:${mode}:busy:${job}`,
   hive: (ca: string) => `engine:hive:${ca}`,
+  /** Dev-buy tokens a launch still owes its owner (DevTokensOwed): it went live without sending them. */
+  devOwed: (ca: string) => `engine:devOwed:${ca}`,
 } as const;
 
 /** Length of an engine hour: a real hour live, the simulator's mock hour (60 s) in mock mode. */
@@ -590,6 +602,27 @@ const starveAction = (ca: string, lastFeeAt: number, at: number): RemoteAction =
 
 const jellyReason = `${cap(theme.hubRitual)} ${theme.copy.reward}: biggest ${theme.unit} by ${theme.copy.resource} received ${pct(theme.hubSplit.toBiggest)}% of the ${theme.hubToken.symbol} bought this hour.`;
 
+/**
+ * Mock mode: MockChain's ledger lives in process memory and starts empty after a restart or on another
+ * server instance, while the hives are persisted. Without this its first answers (balance 0, a made-up
+ * coin) would overwrite every hive's honey, price and bees. Hives it has never seen are handed to it
+ * from their stored rows (honey + reserve as her balance); hives it knows are left alone.
+ */
+function adoptMockHives(d: Deps, hives: RemoteHive[]) {
+  if (d.mode !== 'mock' || d.chain.kind !== 'mock') return;
+  type Adopt = (input: { queenWallet: string; mint: string; lamports: number; price?: number; holders: number; createdAt: number }) => boolean;
+  const adopt = (d.chain as Chain & { adopt?: Adopt }).adopt;
+  if (typeof adopt !== 'function') return;
+  for (const h of hives) {
+    try {
+      const honey = Number.isFinite(h.honey) ? Math.max(0, h.honey) : 0;
+      adopt.call(d.chain, { queenWallet: h.queenWallet, mint: h.ca, lamports: Math.round((honey + d.reserveSol) * LAMPORTS), price: h.price, holders: Number.isFinite(h.bees) ? h.bees : 0, createdAt: h.createdAt });
+    } catch (e) {
+      console.warn(`[hive] engine: mock ledger could not take over ${h.ca}: ${safeErr(e)}`);
+    }
+  }
+}
+
 /** Current price (0 when the chain does not know it) and the average of the last 24 engine hours. */
 async function market(d: Deps, hive: RemoteHive): Promise<{ price: number; avg24h: number }> {
   const info = await d.chain.coinInfo(hive.ca).catch(() => null);
@@ -635,6 +668,19 @@ async function settleSeal(d: Deps, queen: Keypair, hive: RemoteHive, st: HiveEng
   return { burned: delta, decimals, burnTx: r.signature, sol: p.sol };
 }
 
+/** Record on the launch that its dev-buy tokens were delivered (best effort: the transfer is what counts). */
+async function noteDevDelivered(d: Deps, ca: string, launchId: string | undefined, signature: string) {
+  if (!launchId) return;
+  try {
+    const l = await d.db.getLaunch(launchId);
+    if (l && l.mintPubkey === ca && l.state === 'live' && !l.txs.devTransfer) {
+      await d.db.updateLaunch(l.id, { txs: { ...l.txs, devTransfer: signature }, error: '', updatedAt: d.now }, ['live']);
+    }
+  } catch (e) {
+    console.warn(`[hive] engine: dev-buy delivery for ${ca} not noted on its launch: ${safeErr(e)}`);
+  }
+}
+
 /** Claimable creator fees without claiming (LiveChain and test chains expose it). Null when unknown. */
 async function peekClaimable(chain: Chain, queen: Keypair): Promise<number | null> {
   const fn = (chain as Chain & { claimableCreatorFees?: (creator: PublicKey) => Promise<number> }).claimableCreatorFees;
@@ -644,6 +690,74 @@ async function peekClaimable(chain: Chain, queen: Keypair): Promise<number | nul
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : null;
   } catch {
     return null;
+  }
+}
+
+/* ================================================================== */
+/* dev-buy tokens a launch still owes                                  */
+/* ================================================================== */
+
+/**
+ * The owner's dev-buy tokens, left in the queen wallet when her launch went live because every transfer
+ * failed (launch.ts). `amount`: raw units the dev buy brought in (unknown when no balance read
+ * succeeded); `unsureAt`: a transfer was started then and its outcome is unknown.
+ */
+export interface DevTokensOwed {
+  owner: string;
+  amount?: string;
+  launchId?: string;
+  unsureAt?: number;
+}
+
+export async function readDevOwed(db: Db, ca: string): Promise<DevTokensOwed | null> {
+  const raw = await db.getMeta(ENGINE_META.devOwed(ca));
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as Partial<DevTokensOwed>;
+    if (!isObj(v) || typeof v.owner !== 'string' || !isBase58Address(v.owner)) return null;
+    return {
+      owner: v.owner,
+      amount: typeof v.amount === 'string' && /^\d+$/.test(v.amount) ? v.amount : undefined,
+      launchId: typeof v.launchId === 'string' ? v.launchId : undefined,
+      unsureAt: finiteOrNull(v.unsureAt) ?? undefined,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export const writeDevOwed = (db: Db, ca: string, v: DevTokensOwed | null) => db.setMeta(ENGINE_META.devOwed(ca), v ? JSON.stringify(v) : '');
+
+/**
+ * Send owed dev-buy tokens from the queen to the owner, once. The caller makes sure the engine is not
+ * working on this queen (no hour in progress, no seal whose bought tokens are unburned), so her balance
+ * of her own coin is the dev buy alone, or less if an earlier transfer landed after all (a transfer
+ * moves the whole amount at once): then nothing is owed any more. A transfer with an unknown outcome is
+ * journalled first and not repeated before UNSURE_SEND_SETTLE_MS, when the balance is final.
+ * Throws when the transfer fails (still owed).
+ */
+export async function deliverDevTokens(
+  input: { db: Db; chain: Chain; queen: Keypair; queenWallet: string; ca: string; now: number },
+): Promise<{ owed: boolean; signature?: string; launchId?: string; waitMs?: number }> {
+  const { db, chain, ca, now } = input;
+  const owed = await readDevOwed(db, ca);
+  if (!owed) return { owed: false };
+  if (owed.unsureAt !== undefined && now - owed.unsureAt < UNSURE_SEND_SETTLE_MS) return { owed: true, waitMs: owed.unsureAt + UNSURE_SEND_SETTLE_MS - now };
+  const bal = await chain.tokenBalance(input.queenWallet, ca);
+  const amount = owed.amount !== undefined ? BigInt(owed.amount) : bal.amount;
+  if (amount <= 0n || bal.amount < amount) {
+    await writeDevOwed(db, ca, null); // delivered earlier after all (or nothing to deliver)
+    return { owed: false };
+  }
+  const next: DevTokensOwed = { ...owed, amount: amount.toString(), unsureAt: now };
+  await writeDevOwed(db, ca, next); // intent first
+  try {
+    const { signature } = await chain.transferTokens({ from: input.queen, mint: ca, to: owed.owner, amount });
+    await writeDevOwed(db, ca, null);
+    return { owed: false, signature, launchId: owed.launchId };
+  } catch (e) {
+    await writeDevOwed(db, ca, { ...next, unsureAt: definitelyNotSent(e) ? undefined : now }).catch(() => {});
+    throw e;
   }
 }
 
@@ -769,19 +883,27 @@ async function settleBooks(d: Deps, hive: RemoteHive, st: HiveEngineState, res: 
 /**
  * Split `vaultLamports` pro-rata over the holders. Only with a complete holder list (every holder
  * known), only to personal wallets (no bonding curve / pool accounts), never to `exclude`d addresses.
- * Shares below MIN_PAYOUT_LAMPORTS are skipped (their dust stays in the vault).
+ * At most MAX_PAYOUT_RECIPIENTS wallets are paid: the biggest by amount, pro-rata among themselves.
+ * Shares below MIN_PAYOUT_LAMPORTS are skipped (their dust stays in the vault). `retry`: nothing can be
+ * planned because the holder data is missing or incomplete, which may change; anything else is final.
  */
 export function planPayout(
   vaultLamports: number,
-  holders: { count: number; top: { owner: string; amount: bigint }[] } | null,
+  holders: { count: number; top: { owner: string; amount: bigint }[]; complete?: boolean } | null,
   exclude: Set<string>,
-): { recipients: { owner: string; lamports: number }[]; why?: string } {
+): { recipients: { owner: string; lamports: number }[]; why?: string; retry?: boolean } {
   if (!(vaultLamports >= MIN_PAYOUT_LAMPORTS)) return { recipients: [], why: 'it is too small to split' };
-  if (!holders) return { recipients: [], why: 'the holder list is not available here' };
-  if (!holders.top.length || holders.top.length < holders.count) return { recipients: [], why: `only ${holders.top.length} of its ${holders.count} ${theme.holderPlural} are known here` };
-  const list = holders.top.filter((h) => typeof h.owner === 'string' && h.amount > 0n && !exclude.has(h.owner) && isPersonalWallet(h.owner));
-  if (!list.length) return { recipients: [], why: `no ${theme.holder} wallet can receive it` };
-  if (list.length > MAX_PAYOUT_RECIPIENTS) return { recipients: [], why: `it has more than ${MAX_PAYOUT_RECIPIENTS} ${theme.holderPlural} to pay` };
+  if (!holders) return { recipients: [], why: 'the holder list is not available here', retry: true };
+  if (!holders.top.length || holders.top.length < holders.count || holders.complete === false) {
+    return { recipients: [], why: `only ${holders.top.length} of its ${holders.count}${holders.complete === false ? '+' : ''} ${theme.holderPlural} are known here`, retry: true };
+  }
+  const eligible = holders.top.filter((h) => typeof h.owner === 'string' && typeof h.amount === 'bigint' && h.amount > 0n && !exclude.has(h.owner) && isPersonalWallet(h.owner));
+  if (!eligible.length) return { recipients: [], why: `no ${theme.holder} wallet can receive it` };
+  // biggest first (a stable sort: ties keep the chain's order)
+  const list = eligible
+    .slice()
+    .sort((a, b) => (b.amount > a.amount ? 1 : b.amount < a.amount ? -1 : 0))
+    .slice(0, MAX_PAYOUT_RECIPIENTS);
   const total = list.reduce((s, h) => s + h.amount, 0n);
   const vault = BigInt(Math.floor(vaultLamports));
   const recipients = list.map((h) => ({ owner: h.owner, lamports: Number((vault * h.amount) / total) })).filter((r) => r.lamports >= MIN_PAYOUT_LAMPORTS);
@@ -803,6 +925,23 @@ async function payOut(d: Deps, hive: RemoteHive, queen: Keypair, st: HiveEngineS
     const holders = await d.chain.holders(ca).catch(() => null);
     const exclude = new Set([hive.queenWallet, ca, ...(hubWallet ? [hubWallet] : [])]);
     const plan = planPayout(vault, holders, exclude);
+    if (!plan.recipients.length && plan.retry && d.chain.kind === 'live') {
+      // The holders are owed this vault, but who they are is not fully known (yet): nothing is frozen
+      // or marked done, the hive stays in the hourly run (starving) and the payout is tried again
+      // every hour until a complete holder list is available. Mock coins never have one: below.
+      res.notes.push(`Abandon payout waits: ${plan.why}. It is tried again next hour.`);
+      return {
+        done: false,
+        action: {
+          id: `abandon-wait-${ca}`,
+          ca,
+          verb: 'starve',
+          amount: 0,
+          reason: `No fees for ${theme.rules.abandonHours} hours. Its vault of ${fmtSol(vault / LAMPORTS)} SOL is due to its ${theme.holderPlural} pro-rata, but ${plan.why}, so it stays in the ${theme.agent} wallet and the payout is tried again every hour.`,
+          at: d.now,
+        },
+      };
+    }
     if (!plan.recipients.length) {
       st.payout = { at: d.now, vaultLamports: vault, holders: holders?.count ?? 0, recipients: [], doneAt: d.now };
       await writeHiveState(d.db, ca, st);
@@ -926,6 +1065,7 @@ export async function runHourly(ctx: EngineCtx = {}): Promise<HourlySummary> {
     await d.db.setMeta(busyKey, String(Date.now() + HOURLY_LOCK_MS));
 
     const active = (await d.db.listHives()).filter((h) => h.status === d.mode && h.state !== 'abandoned');
+    adoptMockHives(d, active);
     // Neighbour fee growth comes from a snapshot taken before any hive runs, so order does not matter.
     const states = new Map<string, HiveEngineState>();
     for (const h of active) states.set(h.ca, await readHiveState(d.db, h.ca).catch(() => freshState()));
@@ -1015,6 +1155,22 @@ async function runHive(d: Deps, hive: RemoteHive, hc: HourCtx): Promise<HiveRunR
     const state: RemoteState = p.done ? 'abandoned' : hive.state;
     await writeRow(d, hive, st, res, { state, honeyLamports: end });
     return finish({ state });
+  }
+
+  /* ---- 0a. dev-buy tokens her launch could not deliver before it went live (live chains only) ----
+   * Not gated on dry-run: the tokens are the owner's, bought by the launch (which already sends for
+   * real), and the launch told them the tokens arrive within the hour. */
+  if (!st.sealPending && canSend(d)) {
+    try {
+      const r = await deliverDevTokens({ db, chain, queen, queenWallet: qw, ca, now: d.now });
+      if (r.signature) {
+        res.txs.devTokens = r.signature;
+        res.notes.push(`Sent the owner the dev-buy tokens that were still in the ${theme.agent} wallet.`);
+        await noteDevDelivered(d, ca, r.launchId, r.signature);
+      }
+    } catch (e) {
+      res.errors.push(`dev-buy tokens: ${safeErr(e)}`);
+    }
   }
 
   /* ---- 0. an earlier seal whose burn has not happened: burn what it bought ---- */
@@ -1346,6 +1502,13 @@ interface OpenHarvest {
   jellyAmt?: string;
   burnTx?: string;
   jellyTx?: string;
+  /**
+   * Set (to the run's time) before a burn / jelly transfer is sent and cleared once its outcome is
+   * known: one that timed out, or whose run died, may still land, so it is not re-sent before
+   * UNSURE_SEND_SETTLE_MS.
+   */
+  burnUnsureAt?: number;
+  jellyUnsureAt?: number;
   credited?: boolean;
 }
 
@@ -1518,6 +1681,15 @@ async function liveHarvest(d: Deps, hub: { keypair: Keypair; wallet: string; min
   const jellyAmt = BigInt(open.jellyAmt ?? '0');
   const clamp = (v: bigint, max: bigint) => (v < 0n ? 0n : v > max ? max : v);
 
+  // A burn or jelly transfer that timed out may still land while its blockhash is valid: the balance
+  // says nothing final until then, so nothing is sent (again) before UNSURE_SEND_SETTLE_MS has passed.
+  const unsettled = (at: number | undefined) => at !== undefined && d.now - at < UNSURE_SEND_SETTLE_MS;
+  if (unsettled(open.burnUnsureAt) || unsettled(open.jellyUnsureAt)) {
+    const what = unsettled(open.burnUnsureAt) ? 'burn' : `${theme.copy.reward} transfer`;
+    out.pending = `The earlier ${what} may still land; it is checked again once it no longer can.`;
+    return;
+  }
+
   // Burn: anything above (baseline + jelly share) is burn share not yet burned.
   const bal1 = (await d.chain.tokenBalance(hub.wallet, hub.mint)).amount;
   const burnLeft = clamp(bal1 - (before + jellyAmt), burnAmt);
@@ -1526,11 +1698,16 @@ async function liveHarvest(d: Deps, hub: { keypair: Keypair; wallet: string; min
       out.pending = 'Out of time in this run: the burn follows next run.';
       return;
     }
+    // intent first: a run that dies during the send waits like one whose send timed out
+    open.burnUnsureAt = d.now;
+    await saveOpenHarvest(d, open);
     try {
       open.burnTx = (await d.chain.burn({ owner: hub.keypair, mint: hub.mint, amount: burnLeft })).signature;
+      open.burnUnsureAt = undefined;
     } catch (e) {
       out.errors.push(`burn: ${safeErr(e)}`);
       if (e instanceof TxError && e.signature) open.burnTx ??= e.signature;
+      if (definitelyNotSent(e)) open.burnUnsureAt = undefined;
       await saveOpenHarvest(d, open);
       out.pending = 'The burn did not confirm; it is checked again next run.';
       return;
@@ -1546,11 +1723,15 @@ async function liveHarvest(d: Deps, hub: { keypair: Keypair; wallet: string; min
       out.pending = `Out of time in this run: the ${theme.copy.reward} follows next run.`;
       return;
     }
+    open.jellyUnsureAt = d.now; // intent first, as for the burn
+    await saveOpenHarvest(d, open);
     try {
       open.jellyTx = (await d.chain.transferTokens({ from: hub.keypair, mint: hub.mint, to: open.jellyQueen, amount: jellyLeft })).signature;
+      open.jellyUnsureAt = undefined;
     } catch (e) {
       out.errors.push(`${theme.copy.reward}: ${safeErr(e)}`);
       if (e instanceof TxError && e.signature) open.jellyTx ??= e.signature;
+      if (definitelyNotSent(e)) open.jellyUnsureAt = undefined;
       await saveOpenHarvest(d, open);
       out.pending = `The ${theme.copy.reward} transfer did not confirm; it is checked again next run.`;
       return;
@@ -1606,6 +1787,7 @@ export async function runRefresh(ctx: EngineCtx = {}): Promise<RefreshSummary> {
   if (!(await d.db.lock('engine:refresh', Date.now() + REFRESH_LOCK_MS))) return { ...out, skipped: 'Another refresh is in progress.', ms: Date.now() - t0 };
   try {
     const hives = (await d.db.listHives()).filter((h) => h.status === d.mode && h.state !== 'abandoned');
+    adoptMockHives(d, hives);
     const results = await pool(hives, d.concurrency, async (h) => {
       try {
         return { ca: h.ca, outcome: await refreshHive(d, h) };

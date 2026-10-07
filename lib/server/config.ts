@@ -64,6 +64,11 @@ export function liveModeProblems(): string[] {
   return p;
 }
 
+/**
+ * What the browser needs. `realtime` is 'supabase' only when browsers can subscribe themselves (URL +
+ * anon key); otherwise 'sse', which /api/stream serves for both stores: the file store's in-process
+ * feed, or (a Supabase store without an anon key) a loop that polls the database.
+ */
 export function publicConfig(): PublicConfig {
   const realtime = config.supabase.url && config.supabase.anonKey && hasSupabase() ? 'supabase' : 'sse';
   return {

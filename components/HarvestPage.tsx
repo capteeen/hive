@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useNow } from '@/lib/useNow';
 import { createChart, ColorType, type IChartApi, type Time } from 'lightweight-charts';
 import { useHive } from '@/lib/store';
+import { harvestOnChain, isServerHarvest } from '@/lib/remoteMap';
 import { theme } from '@/themes';
 import { fmtCompact, fmtSol, short, txUrl, timeAgo, addrUrl } from '@/lib/format';
 import HarvestCountdown from './HarvestCountdown';
@@ -19,6 +20,10 @@ export default function HarvestPage() {
   const pool = useHive((s) => s.world.hubPool);
   const price = useHive((s) => s.world.hubPrice);
   const mode = useHive((s) => s.mode);
+  // only the live server's harvests are real transactions; unknown until /api/config has loaded
+  const launchMode = useHive((s) => s.config?.launchMode);
+  // the server does not publish its pool or the token price: with no demo hives there is nothing to show
+  const demo = useHive((s) => s.config?.demoHives !== false);
   const chartRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const now = useNow(5000);
@@ -74,9 +79,9 @@ export default function HarvestPage() {
         </div>
         <div className="grid grid-cols-2 gap-3">
           <Big label={`${theme.hubToken.symbol} burned`} value={fmtCompact(burned)} />
-          <Big label="pool for next" value={fmtSol(pool, 3)} />
+          <Big label="pool for next" value={demo ? fmtSol(pool, 3) : '—'} />
           <Big label="fees collected (shown)" value={fmtSol(totals.fees, 2)} />
-          <Big label={`${theme.hubToken.symbol} price`} value={`${price.toFixed(8)} SOL`} />
+          <Big label={`${theme.hubToken.symbol} price`} value={price > 0 ? `${price.toFixed(8)} SOL` : '—'} />
         </div>
       </div>
 
@@ -122,12 +127,18 @@ export default function HarvestPage() {
                     </td>
                     <td className="px-4 py-3 text-right text-royal">{fmtCompact(h.jellyAmount)}</td>
                     <td className="px-4 py-3 text-right">
-                      {h.dryRun || !h.txSig ? (
+                      {h.dryRun ? (
                         <span className="text-text/45" title="Planned by the engine in dry-run mode: nothing was sent">dry run</span>
-                      ) : (
+                      ) : harvestOnChain(h, launchMode) ? (
                         <a href={txUrl(h.txSig)} target="_blank" rel="noreferrer" className="text-accent/80 hover:text-accent">
                           {short(h.txSig, 4)} ↗
                         </a>
+                      ) : isServerHarvest(h) && launchMode !== 'mock' ? (
+                        <span className="text-text/45">—</span>
+                      ) : (
+                        <span className="text-text/45" title={`Simulated ${theme.hubRitual}: no transaction was sent`}>
+                          simulated
+                        </span>
                       )}
                     </td>
                   </tr>

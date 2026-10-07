@@ -42,6 +42,29 @@ export interface HiveLookupDeps {
   timeoutMs?: number;
   /** Delay before retry number `attempt` (0-based). */
   retryMs?: (attempt: number) => number;
+  /**
+   * Whether a refusal by the store is final. Until GET /api/config has loaded, the browser's demo hives
+   * still sit on cells that a demo-off server hands out to real hives (from the origin outward), so the
+   * store refusing a hive then proves nothing. Default: the store has its config.
+   */
+  configReady?: () => boolean;
+  /** Calls `fn` once, when the config has loaded. Returns an unsubscribe. Default: a store subscription. */
+  whenConfigReady?: (fn: () => void) => () => void;
+}
+
+const storeConfigReady = () => useHive.getState().config !== null;
+function whenStoreConfigReady(fn: () => void): () => void {
+  if (storeConfigReady()) {
+    fn();
+    return () => {};
+  }
+  // setConfig applies the config and drops the demo hives in one update, so `fn` sees both
+  const unsubscribe = useHive.subscribe((s) => {
+    if (!s.config) return;
+    unsubscribe();
+    fn();
+  });
+  return unsubscribe;
 }
 
 const LOOKUP_TIMEOUT_MS = 10_000;
@@ -64,10 +87,23 @@ function isDetailFor(ca: string, d: HiveDetailResponse): boolean {
 export function watchHiveLookup(ca: string, deps: HiveLookupDeps): () => void {
   const timeoutMs = deps.timeoutMs ?? LOOKUP_TIMEOUT_MS;
   const retryMs = deps.retryMs ?? lookupBackoff;
+  const configReady = deps.configReady ?? storeConfigReady;
+  const whenConfigReady = deps.whenConfigReady ?? whenStoreConfigReady;
   let stopped = false;
   let attempt = 0;
   let retry: ReturnType<typeof setTimeout> | null = null;
   let inflight: AbortController | null = null;
+  let waiting: (() => void) | null = null;
+
+  /** The store would not place the hive: final once the config is in, otherwise ask again when it is. */
+  const refused = (detail: HiveDetailResponse) => {
+    if (configReady()) return deps.onState('missing');
+    waiting = whenConfigReady(() => {
+      waiting = null;
+      if (stopped) return;
+      if (!deps.adopt(detail)) deps.onState('missing');
+    });
+  };
 
   const once = async () => {
     retry = null;
@@ -84,8 +120,9 @@ export function watchHiveLookup(ca: string, deps: HiveLookupDeps): () => void {
       }
       if (!isDetailFor(ca, detail)) throw new Error('unexpected hive detail');
       // Adopted: the page re-renders with the hive and stops this watcher. Not adopted means the
-      // store refused it (its cell is taken by a demo hive), so it cannot be shown on the comb either.
-      if (!deps.adopt(detail)) deps.onState('missing');
+      // store refused it (its cell is taken by a demo hive), so it cannot be shown on the comb either,
+      // unless the config that may remove the demo hives has not arrived yet.
+      if (!deps.adopt(detail)) refused(detail);
     } catch {
       if (stopped) return;
       deps.onState('unreachable');
@@ -104,6 +141,8 @@ export function watchHiveLookup(ca: string, deps: HiveLookupDeps): () => void {
     retry = null;
     inflight?.abort();
     inflight = null;
+    waiting?.();
+    waiting = null;
   };
 }
 

@@ -51,6 +51,7 @@ function harness(over: Partial<HiveLookupDeps> = {}) {
     onState: (s) => states.push(s),
     timeoutMs: 10_000,
     retryMs: () => 1_000,
+    configReady: () => true, // /api/config has loaded unless a test says otherwise
     ...over,
   };
   return { deps, states };
@@ -136,6 +137,37 @@ describe('watchHiveLookup', () => {
     const { deps, states } = harness({ adopt: vi.fn(() => false) });
     watchHiveLookup(CA, deps);
     await vi.runAllTimersAsync();
+    expect(states).toEqual(['checking', 'missing']);
+  });
+
+  it('a refusal before /api/config has loaded waits for the config, then asks the store again', async () => {
+    let ready = false;
+    let fire: () => void = () => {};
+    const adopt = vi.fn(() => ready); // the demo hive on the cell goes away with the config (demo off)
+    const { deps, states } = harness({
+      adopt,
+      configReady: () => ready,
+      whenConfigReady: (fn) => {
+        fire = fn;
+        return () => (fire = () => {});
+      },
+    });
+    watchHiveLookup(CA, deps);
+    await vi.runAllTimersAsync();
+    expect(states).toEqual(['checking']);
+    ready = true;
+    fire();
+    expect(adopt).toHaveBeenCalledTimes(2);
+    expect(states).toEqual(['checking']);
+  });
+
+  it('a refusal that still stands once the config is in is "missing"', async () => {
+    let fire: () => void = () => {};
+    const { deps, states } = harness({ adopt: vi.fn(() => false), configReady: () => false, whenConfigReady: (fn) => ((fire = fn), () => {}) });
+    watchHiveLookup(CA, deps);
+    await vi.runAllTimersAsync();
+    expect(states).toEqual(['checking']);
+    fire();
     expect(states).toEqual(['checking', 'missing']);
   });
 

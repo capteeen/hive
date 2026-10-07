@@ -296,4 +296,34 @@ export class MockChain implements Chain {
   airdrop(pubkey: string, lamports: number) {
     this.credit(pubkey, lamports);
   }
+
+  /**
+   * Take over a hive this ledger has never seen (it was founded before a restart, or on another server
+   * instance): the hives are persisted, the ledger is not. Her balance is rebuilt from the stored honey
+   * (`lamports`), and her coin from the stored price and bees, so the engine and the refresh carry on
+   * from what everybody already sees instead of resetting it (honey 0, made-up price and bees). A queen
+   * or coin the ledger already knows is left exactly as it is. Returns whether anything was adopted.
+   */
+  adopt(input: { queenWallet: string; mint: string; lamports: number; price?: number; holders: number; createdAt: number }): boolean {
+    let changed = false;
+    if (!this.sol.has(input.queenWallet)) {
+      this.sol.set(input.queenWallet, Math.max(0, Math.round(input.lamports)));
+      changed = true;
+    }
+    const c = this.coins.get(input.mint);
+    if (!c?.creator) {
+      // unknown, or only made up on the fly by coin() for a read: the stored hive knows better
+      const t = this.now();
+      const price = input.price && Number.isFinite(input.price) && input.price > 0 ? Math.min(MAX_PRICE, input.price) : (c?.price ?? START_PRICE);
+      this.coins.set(input.mint, { creator: input.queenWallet, createdAt: input.createdAt, price, priceAt: t, holders: Math.max(0, Math.round(input.holders)), holdersAt: t });
+      changed = true;
+    }
+    if (!this.vaults.has(input.queenWallet)) {
+      // her fee vault ages from the hive's birth, not from the restart
+      const t = this.now();
+      this.vaults.set(input.queenWallet, { vigor: 0.2 + 0.8 * hash01(input.queenWallet), lastAt: t, bornAt: Math.min(t, input.createdAt) });
+      changed = true;
+    }
+    return changed;
+  }
 }

@@ -12,6 +12,7 @@ import 'server-only';
  *
  * Nothing here logs or returns secret keys.
  */
+import { createHash } from 'node:crypto';
 import bs58 from 'bs58';
 import {
   ComputeBudgetProgram,
@@ -52,6 +53,39 @@ const TOKEN_AMOUNT_OFFSET = 64;
 /** Mint layout: mintAuthority COption<Pubkey> (36) | supply u64 (8) | decimals u8. */
 const MINT_DECIMALS_OFFSET = 44;
 const SIGNATURE_RE = /^[1-9A-HJ-NP-Za-km-z]{64,90}$/;
+/** DAS pages of 1000 token accounts read for a holder list (50k accounts). */
+const HOLDER_PAGES = 50;
+
+/**
+ * The only programs a PumpPortal transaction may call at the top level. Any other program would get
+ * our wallet's signer privilege and could move its SOL by CPI. PumpPortal's own fee is a plain System
+ * transfer (counted against the outflow cap); pump.fun's SOL movement happens inside its programs.
+ */
+const PORTAL_PROGRAMS: readonly PublicKey[] = [
+  ComputeBudgetProgram.programId,
+  SystemProgram.programId,
+  TOKEN_PROGRAM_ID,
+  TOKEN_2022_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+  PUMP_PROGRAM_ID,
+  PUMP_AMM_PROGRAM_ID,
+];
+/**
+ * Top-level token instructions a PumpPortal transaction may use (wrapping and unwrapping SOL, setting
+ * up accounts): 1/16/18 InitializeAccount(2/3), 9 CloseAccount (rent back to us only), 17 SyncNative,
+ * 22 InitializeImmutableOwner. Nothing that moves, burns or delegates tokens.
+ */
+const PORTAL_TOKEN_IXS = new Set([1, 9, 16, 17, 18, 22]);
+/** The runtime's compute-unit ceiling and its default per instruction when no limit is set. */
+const MAX_COMPUTE_UNITS = 1_400_000;
+const DEFAULT_UNITS_PER_IX = 200_000;
+/** Anchor discriminators of the pump.fun / PumpSwap buys and the argument that caps the SOL they spend. */
+const anchorIx = (name: string) => createHash('sha256').update(`global:${name}`).digest().subarray(0, 8);
+const PUMP_BUYS: { disc: Buffer; maxSolOffset: number }[] = [
+  { disc: anchorIx('buy'), maxSolOffset: 16 }, // buy { amount, max_sol_cost } (PumpSwap: base_amount_out, max_quote_amount_in)
+  { disc: anchorIx('buy_exact_sol_in'), maxSolOffset: 8 }, // { spendable_sol_in, min_tokens_out }
+  { disc: anchorIx('buy_exact_quote_in'), maxSolOffset: 8 }, // PumpSwap { spendable_quote_in, min_base_amount_out }
+];
 
 /** A non-200 answer from PumpPortal; `body` is its (truncated) text for matching and display. */
 export class PortalError extends Error {
@@ -190,15 +224,22 @@ export class LiveChain implements Chain {
     }
   }
 
-  async holders(mint: string): Promise<{ count: number; top: { owner: string; amount: bigint }[] } | null> {
+  /**
+   * Every owner with a positive balance (token accounts summed per owner), largest first, from Helius
+   * DAS. The whole list is returned, not a top-N: the abandon payout needs to know every holder to
+   * split a vault (it pays at most MAX_PAYOUT_RECIPIENTS of them, see engine.ts). `complete: false`
+   * when the page cap was hit before the last page, so the list may be missing holders.
+   */
+  async holders(mint: string): Promise<{ count: number; top: { owner: string; amount: bigint }[]; complete: boolean } | null> {
     const key = config.heliusApiKey;
     if (!key) return null;
     const url = `https://mainnet.helius-rpc.com/?api-key=${encodeURIComponent(key)}`;
     const byOwner = new Map<string, bigint>();
     const limit = 1000;
+    let complete = false;
     try {
       // DAS pages are 1-based; stop at a short page (or after 50k accounts, which is plenty for a count).
-      for (let page = 1; page <= 50; page++) {
+      for (let page = 1; page <= HOLDER_PAGES; page++) {
         const res = await this.fetch(url, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
@@ -214,16 +255,18 @@ export class LiveChain implements Chain {
           const amt = toBigInt(a.amount);
           if (amt > 0n) byOwner.set(a.owner, (byOwner.get(a.owner) ?? 0n) + amt);
         }
-        if (accounts.length < limit) break;
+        if (accounts.length < limit) {
+          complete = true;
+          break;
+        }
       }
     } catch {
       return null;
     }
     const top = [...byOwner.entries()]
-      .sort((a, b) => (b[1] > a[1] ? 1 : b[1] < a[1] ? -1 : 0))
-      .slice(0, 10)
+      .sort((a, b) => (b[1] > a[1] ? 1 : b[1] < a[1] ? -1 : a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
       .map(([owner, amount]) => ({ owner, amount }));
-    return { count: byOwner.size, top };
+    return { count: byOwner.size, top, complete };
   }
 
   /* ---------------- pump.fun via PumpPortal ---------------- */
@@ -381,9 +424,12 @@ export class LiveChain implements Chain {
 
   /**
    * Refuse to sign a PumpPortal transaction that does not look like what we asked for: the fee payer
-   * must be our wallet, only our keys may sign, top-level System instructions may only create accounts
-   * or transfer (with a cap on SOL moved out of the payer), and top-level token instructions may not
-   * hand out authority or move tokens. pump.fun's own SOL movement happens inside its program (CPI).
+   * must be our wallet, only our keys may sign, only allow-listed programs may be called at the top
+   * level (PORTAL_PROGRAMS), the priority fee (unit limit × unit price) may not exceed twice
+   * PRIORITY_FEE_SOL, top-level System instructions may only create accounts or transfer (with a cap on
+   * SOL moved out of the payer), top-level token instructions may only set up, sync or close accounts,
+   * and a pump.fun / PumpSwap buy may not allow itself to spend more than that same cap. pump.fun's
+   * own SOL movement happens inside its programs (CPI).
    */
   private guard(tx: VersionedTransaction, opts: { payer: PublicKey; signers: PublicKey[]; mustSign?: PublicKey; maxDirectOutLamports: number }) {
     const msg = tx.message;
@@ -394,11 +440,28 @@ export class LiveChain implements Chain {
     for (const s of signers) if (!opts.signers.some((k) => k.equals(s))) throw new Error('PumpPortal returned a transaction that needs an unexpected signer; not signing it.');
     if (opts.mustSign && !signers.some((s) => s.equals(opts.mustSign!))) throw new Error('PumpPortal returned a create transaction that does not use our mint; not signing it.');
     let out = 0n;
+    let viaPump = 0n;
+    let unitLimit: number | null = null;
+    let unitPrice = 0n; // micro-lamports per compute unit
+    let otherIxs = 0;
     for (const ix of msg.compiledInstructions) {
-      const program = keys[ix.programIdIndex];
+      // Program ids are always static keys; an index into the lookup tables is not a known program.
+      const program = ix.programIdIndex < keys.length ? keys[ix.programIdIndex] : undefined;
+      if (!program || !PORTAL_PROGRAMS.some((p) => p.equals(program))) {
+        throw new Error(`PumpPortal transaction calls an unexpected program (${program?.toBase58() ?? 'from a lookup table'}); not signing it.`);
+      }
       const data = Buffer.from(ix.data);
       const acct = (i: number) => keys[ix.accountKeyIndexes[i]];
-      if (program?.equals(SystemProgram.programId)) {
+      if (program.equals(ComputeBudgetProgram.programId)) {
+        // 1 RequestHeapFrame(u32), 2 SetComputeUnitLimit(u32), 3 SetComputeUnitPrice(u64), 4 SetLoadedAccountsDataSizeLimit(u32)
+        const kind = data.length ? data[0] : -1;
+        if (kind === 2 && data.length >= 5) unitLimit = Math.max(unitLimit ?? 0, data.readUInt32LE(1));
+        else if (kind === 3 && data.length >= 9) unitPrice = maxBig(unitPrice, data.readBigUInt64LE(1));
+        else if (!((kind === 1 || kind === 4) && data.length >= 5)) throw new Error(`PumpPortal transaction has an unexpected compute-budget instruction (${kind}); not signing it.`);
+        continue;
+      }
+      otherIxs++;
+      if (program.equals(SystemProgram.programId)) {
         const kind = data.length >= 4 ? data.readUInt32LE(0) : -1;
         // 0 CreateAccount { lamports, space, owner }, 2 Transfer { lamports }
         if ((kind === 0 || kind === 2) && data.length >= 12) {
@@ -406,15 +469,27 @@ export class LiveChain implements Chain {
         } else {
           throw new Error(`PumpPortal transaction has an unexpected System instruction (${kind}); not signing it.`);
         }
-      } else if (program?.equals(TOKEN_PROGRAM_ID) || program?.equals(TOKEN_2022_PROGRAM_ID)) {
+      } else if (program.equals(TOKEN_PROGRAM_ID) || program.equals(TOKEN_2022_PROGRAM_ID)) {
         const kind = data.length ? data[0] : -1;
-        // 3 Transfer, 4 Approve, 6 SetAuthority, 12 TransferChecked, 13 ApproveChecked
-        if ([3, 4, 6, 12, 13].includes(kind)) throw new Error(`PumpPortal transaction has an unexpected token instruction (${kind}); not signing it.`);
+        if (!PORTAL_TOKEN_IXS.has(kind)) throw new Error(`PumpPortal transaction has an unexpected token instruction (${kind}); not signing it.`);
         // 9 CloseAccount: the rent must come back to us
         if (kind === 9 && !acct(1)?.equals(opts.payer)) throw new Error('PumpPortal transaction closes an account to someone else; not signing it.');
+      } else if (program.equals(PUMP_PROGRAM_ID) || program.equals(PUMP_AMM_PROGRAM_ID)) {
+        const buy = PUMP_BUYS.find((b) => data.length >= 8 && data.subarray(0, 8).equals(b.disc));
+        if (buy) {
+          if (data.length < buy.maxSolOffset + 8) throw new Error('PumpPortal transaction has a buy without a spending limit; not signing it.');
+          viaPump += data.readBigUInt64LE(buy.maxSolOffset);
+        }
       }
     }
-    if (out > BigInt(opts.maxDirectOutLamports)) throw new Error(`PumpPortal transaction moves ${Number(out) / LAMPORTS} SOL directly out of the wallet; not signing it.`);
+    const cap = BigInt(opts.maxDirectOutLamports);
+    if (out > cap) throw new Error(`PumpPortal transaction moves ${Number(out) / LAMPORTS} SOL directly out of the wallet; not signing it.`);
+    if (viaPump > cap) throw new Error(`PumpPortal transaction lets pump.fun spend up to ${Number(viaPump) / LAMPORTS} SOL; not signing it.`);
+    // Priority fee = unit limit × unit price; without a limit the runtime grants 200k units per instruction.
+    const units = BigInt(Math.min(MAX_COMPUTE_UNITS, unitLimit ?? DEFAULT_UNITS_PER_IX * Math.max(1, otherIxs)));
+    const priorityLamports = (units * unitPrice + 999_999n) / 1_000_000n;
+    const maxPriority = BigInt(Math.max(0, Math.ceil(config.priorityFeeSol * 2 * LAMPORTS)));
+    if (priorityLamports > maxPriority) throw new Error(`PumpPortal transaction sets a priority fee of ${Number(priorityLamports) / LAMPORTS} SOL; not signing it.`);
   }
 
   private async sendIxs(ixs: TransactionInstruction[], payer: Keypair): Promise<string> {
@@ -481,6 +556,8 @@ async function safeText(res: Response): Promise<string> {
     return '';
   }
 }
+
+const maxBig = (a: bigint, b: bigint) => (a > b ? a : b);
 
 function toBigInt(v: unknown): bigint {
   if (typeof v === 'bigint') return v;

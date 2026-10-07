@@ -2,23 +2,36 @@ import 'server-only';
 /**
  * Queen (and mint) secret keys, encrypted at rest with AES-256-GCM.
  * Format: v1.<iv b64>.<tag b64>.<ciphertext b64>. The key comes from QUEEN_KEY_SECRET (32 bytes, base64 or hex).
- * In mock mode without QUEEN_KEY_SECRET a per-process dev key is used and logged once; never use that live.
+ * In mock mode without QUEEN_KEY_SECRET a development key is used (see devKeyFor); never use that live.
  */
-import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from 'node:crypto';
 import { Keypair } from '@solana/web3.js';
-import { config } from './config';
+import { config, hasSupabase } from './config';
 
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const g = globalThis as unknown as { __hiveDevKey?: Buffer };
 
+/** Salt of the HKDF that derives the shared development key from the Supabase service-role key. */
+export const DEV_KEY_SALT = 'hive-dev-queen-key';
+let sharedDevKey: { from: string; key: Buffer } | null = null;
+
 /**
- * Mock mode without QUEEN_KEY_SECRET: one key per data dir, persisted so queens founded before a
- * restart stay decryptable, and shared via globalThis so the engine ticker (instrumentation) and the
- * route handlers, which can load separate module instances, use the same key.
+ * Mock mode without QUEEN_KEY_SECRET.
+ *  - With Supabase (several server instances, e.g. Vercel, sharing one database): every instance must
+ *    read the keys the others encrypted, and their /tmp is not shared. The key is derived from the one
+ *    secret they all have, SUPABASE_SERVICE_ROLE_KEY (HKDF-SHA256, salt DEV_KEY_SALT), so they agree.
+ *  - With the local file store: one random key per data dir, persisted next to the data so queens
+ *    founded before a restart stay decryptable, and shared via globalThis so the engine ticker
+ *    (instrumentation) and the route handlers, which can load separate module instances, use the same key.
  */
 function devKeyFor(): Buffer {
+  const service = hasSupabase() ? config.supabase.serviceKey : undefined;
+  if (service) {
+    if (sharedDevKey?.from !== service) sharedDevKey = { from: service, key: Buffer.from(hkdfSync('sha256', service, DEV_KEY_SALT, '', 32)) };
+    return sharedDevKey.key;
+  }
   if (g.__hiveDevKey) return g.__hiveDevKey;
   const file = path.join(config.dataDir, 'dev-queen-key');
   let k: Buffer | null = null;

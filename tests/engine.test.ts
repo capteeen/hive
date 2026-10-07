@@ -12,6 +12,7 @@ import { newKeypair } from '@/lib/server/keys';
 import {
   ENGINE_META,
   MIN_PAYOUT_LAMPORTS,
+  UNSURE_SEND_SETTLE_MS,
   cronAuth,
   cronDryRun,
   planPayout,
@@ -426,18 +427,29 @@ describe('starving and abandonment', () => {
     expect(abandon).toMatchObject({ verb: 'abandon', amount: 1, txSig: pays[0].signature });
     expect(abandon.reason).toBe('No fees for 24 hours. Hive abandoned. Vault of 1.00 SOL paid out pro-rata to 2 bees. The cell stays on the map as grey comb.');
 
-    // no holder list: abandoned, nothing sent, and the log says why
+    // no holder list: nothing sent and nothing settled. The vault stays owed, the hive stays in the
+    // hourly run (starving) and the payout is tried again every hour; the log says why, once.
     expect(w.chain.sends('transferSol').some((x) => x.from === unknown.queenWallet)).toBe(false);
-    expect((await w.db.getHive(unknown.ca))!.state).toBe('abandoned');
-    const kept = w.db.actions.find((a) => a.id === `abandon-${unknown.ca}`)!;
-    expect(kept.amount).toBe(0);
-    expect(kept.reason).toMatch(/vault of 0\.500 SOL is due to its bees pro-rata, but the holder list is not available here, so it stays in the queen wallet/);
+    expect((await w.db.getHive(unknown.ca))!.state).toBe('starving');
+    expect(w.db.actions.find((a) => a.id === `abandon-${unknown.ca}`)).toBeUndefined();
+    const waiting = w.db.actions.find((a) => a.id === `abandon-wait-${unknown.ca}`)!;
+    expect(waiting).toMatchObject({ verb: 'starve', amount: 0 });
+    expect(waiting.reason).toMatch(/vault of 0\.500 SOL is due to its bees pro-rata, but the holder list is not available here, so it stays in the queen wallet and the payout is tried again every hour/);
+    expect((await readHiveState(w.db, unknown.ca)).payout).toBeNull();
 
-    // abandoned hives are left alone from now on
+    // abandoned hives are left alone from now on; the unpaid one is tried again
     const before = w.chain.sent.length;
     const next = await runHourly(w.ctx({ now: T0 + HOUR }));
-    expect(next.hives.map((h) => h.ca).sort()).toEqual([silent.ca, back.ca].sort());
+    expect(next.hives.map((h) => h.ca).sort()).toEqual([silent.ca, back.ca, unknown.ca].sort());
     expect(w.chain.sent.length).toBe(before);
+    expect(w.db.actions.filter((a) => a.id === `abandon-wait-${unknown.ca}`)).toHaveLength(1);
+
+    // once the holder list is available, the vault is paid and the hive is abandoned
+    const holder = walletAddress();
+    w.chain.holderLists.set(unknown.ca, { count: 1, top: [{ owner: holder, amount: 5n }] });
+    await runHourly(w.ctx({ now: T0 + 2 * HOUR }));
+    expect(w.chain.sends('transferSol').filter((x) => x.from === unknown.queenWallet).map((x) => [x.to, x.lamports])).toEqual([[holder, 500_000_000]]);
+    expect((await w.db.getHive(unknown.ca))!.state).toBe('abandoned');
   });
 
   it('an abandon payout that fails part-way pays only who is still owed, next hour', async () => {
@@ -549,7 +561,14 @@ describe('runHarvest', () => {
     expect(s1.pending).toMatch(/burn did not confirm/);
     expect(w.db.harvests).toHaveLength(0);
 
-    const s2 = await runHarvest(w.ctx({ now: T0 + 60_000 }));
+    // a minute later the burn may still land: nothing is sent or decided yet
+    const wait = await runHarvest(w.ctx({ now: T0 + 60_000 }));
+    expect(wait.pending).toMatch(/may still land/);
+    expect(wait.harvest).toBeUndefined();
+    expect(w.chain.sends('burn')).toHaveLength(1);
+    expect(w.chain.sends('transferTokens')).toHaveLength(0);
+
+    const s2 = await runHarvest(w.ctx({ now: T0 + UNSURE_SEND_SETTLE_MS }));
     expect(s2.harvest).toBeDefined();
     expect(w.chain.sends('buy')).toHaveLength(1);
     expect(w.chain.sends('burn')).toHaveLength(1);

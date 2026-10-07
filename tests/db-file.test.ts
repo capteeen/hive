@@ -450,7 +450,7 @@ describe('GET /api/stream', () => {
     vi.useRealTimers();
   });
 
-  it('streams events, omits unchanged images, pings every 20s and unsubscribes on abort', async () => {
+  it('streams events with image URLs (never data URLs), pings every 20s and unsubscribes on abort', async () => {
     vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'Date'] });
     vi.resetModules();
     vi.doMock('@/lib/server/db', () => ({ getDb: async () => db }));
@@ -466,9 +466,11 @@ describe('GET /api/stream', () => {
     await db.upsertHive(hive('A', 0, 0));
     const first = await next();
     expect(first).toMatch(/^event: hive\ndata: /);
-    expect(JSON.parse(first.split('data: ')[1]).image).toBe('data:image/png;base64,AAAA');
+    const url = JSON.parse(first.split('data: ')[1]).image as string;
+    expect(url).toMatch(/^\/api\/hives\/A\/image\?v=[0-9a-z]+$/); // the bytes are served by the image route
+    expect(await db.getMeta('image:A')).toBe('data:image/png;base64,AAAA');
     await db.upsertHive(hive('A', 0, 0, { honey: 1, updatedAt: 2_000 }));
-    expect(JSON.parse((await next()).split('data: ')[1]).image).toBe(''); // unchanged image not re-sent
+    expect(JSON.parse((await next()).split('data: ')[1]).image).toBe(url); // a few bytes: always sent
 
     vi.advanceTimersByTime(20_000);
     expect(await next()).toMatch(/^event: ping\ndata: \d+\n\n$/); // a named event the page can see

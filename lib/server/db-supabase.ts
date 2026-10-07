@@ -7,11 +7,15 @@ import 'server-only';
  *
  * Realtime: hives / actions / harvests are in the supabase_realtime publication and readable by
  * anon, so browsers subscribe to Postgres changes directly; subscribe() here is a no-op.
+ *
+ * Images: a data-URL hive image (mock launches) is stored in `meta` under `image:<ca>` and the hive
+ * row gets the short `/api/hives/<ca>/image?v=…` path instead, so list reads and Realtime payloads
+ * never carry image bytes. FileDb does the same.
  */
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { Cell } from '@/lib/types';
 import type { LaunchMode, LaunchState, RemoteAction, RemoteHarvest, RemoteHive, StreamEvent } from '@/lib/shared/api';
-import { actionToRow, harvestToRow, hiveToRow, mapRows, rowToAction, rowToHarvest, rowToHive, rowToPrice, toIso, toMs, toNum } from '@/lib/shared/rows';
+import { actionToRow, harvestToRow, hiveImageMetaKey, hiveImagePath, hiveToRow, isDataUrl, mapRows, rowToAction, rowToHarvest, rowToHive, rowToPrice, toIso, toMs, toNum } from '@/lib/shared/rows';
 import type { Db, LaunchRecord } from './db';
 
 /** PostgREST's default max rows per request; listHives / takenCells page through it. */
@@ -160,7 +164,13 @@ export class SupabaseDb implements Db {
   }
 
   async upsertHive(h: RemoteHive): Promise<void> {
-    const { error } = await this.sb.from('hives').upsert(hiveToRow(h), { onConflict: 'ca' });
+    const row = hiveToRow(h);
+    if (isDataUrl(h.image)) {
+      // The image first: once the row (and its Realtime event) points at the image route, it must resolve.
+      await this.setMeta(hiveImageMetaKey(h.ca), h.image);
+      row.image = hiveImagePath(h.ca, h.image);
+    }
+    const { error } = await this.sb.from('hives').upsert(row, { onConflict: 'ca' });
     if (error) fail('upsertHive', error);
   }
 

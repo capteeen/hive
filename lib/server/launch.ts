@@ -24,6 +24,7 @@ import 'server-only';
 import { randomBytes } from 'node:crypto';
 import bs58 from 'bs58';
 import nacl from 'tweetnacl';
+import { PublicKey, type Keypair } from '@solana/web3.js';
 import {
   LIMITS,
   isBase58Address,
@@ -43,7 +44,8 @@ import { getDb, type Db, type LaunchRecord } from './db';
 import { BASE_FEE_LAMPORTS, TxError, getChain, type Chain } from './chain';
 import { claimLaunchCell } from './cells';
 import { keypairFromEnc, newKeypair } from './keys';
-import { rateLimit } from './ratelimit';
+import { ENGINE_META, deliverDevTokens, readDevOwed, readHiveState, writeDevOwed } from './engine';
+import { clientIp, rateLimit } from './ratelimit';
 
 /* ---------------- knobs ---------------- */
 export const MAX_ATTEMPTS = 5;
@@ -58,6 +60,12 @@ const PAYMENT_GRACE_MS = 10 * 60 * 1000;
  * exists. After the wait the mint check below is final.
  */
 export const CREATE_SETTLE_MS = 3 * 60 * 1000;
+/**
+ * How long after an expired launch last changed a payment signature on record that cannot be found
+ * still blocks its refund. The signature was recorded at or before that change, and a transaction
+ * that is not found by then can no longer land (its blockhash lives ~60–90 s).
+ */
+export const PAYMENT_SETTLE_MS = 3 * 60 * 1000;
 export const RATE = {
   prepareIp: { limit: 12, windowMs: 10 * 60 * 1000 },
   prepareOwner: { limit: 6, windowMs: 10 * 60 * 1000 },
@@ -169,15 +177,18 @@ const ipfsToHttps = (u: string) => (u.startsWith('ipfs://') ? `https://ipfs.io/i
 
 /** Keep only what we store: trimmed strings, clamped rules, a known look. */
 function sanitise(p: LaunchPayload): LaunchPayload {
-  const opt = (s: string | undefined, max: number) => {
-    const t = (s ?? '').trim();
+  // control characters, zero-width and bidi-override characters never belong in a hive's text
+  const strip = (s: string, keepNewlines = false) =>
+    s.replace(keepNewlines ? /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g : /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2069\ufeff]/g, '');
+  const opt = (s: string | undefined, max: number, keepNewlines = false) => {
+    const t = strip(s ?? '', keepNewlines).trim();
     return t ? t.slice(0, max) : undefined;
   };
   return {
     owner: p.owner,
-    name: p.name.trim(),
+    name: strip(p.name).trim(),
     ticker: p.ticker.trim().toUpperCase(),
-    description: opt(p.description, LIMITS.description),
+    description: opt(p.description, LIMITS.description, true),
     motto: opt(p.motto, LIMITS.motto),
     telegram: opt(p.telegram, LIMITS.link),
     twitter: opt(p.twitter, LIMITS.link),
@@ -186,7 +197,7 @@ function sanitise(p: LaunchPayload): LaunchPayload {
     cell: p.cell ? { q: p.cell.q, r: p.cell.r } : null,
     look: isLook(p.look) ? p.look : DEFAULT_LOOK,
     rules: clampRules(p.rules),
-    temperament: { dip: String(p.temperament.dip).slice(0, 40), swarm: String(p.temperament.swarm).slice(0, 40) },
+    temperament: { dip: strip(String(p.temperament.dip)).slice(0, 40), swarm: strip(String(p.temperament.swarm)).slice(0, 40) },
     issuedAt: p.issuedAt,
   };
 }
@@ -198,7 +209,7 @@ function sanitise(p: LaunchPayload): LaunchPayload {
 export async function prepareLaunch(body: unknown, ctx: LaunchCtx = {}): Promise<LaunchPrepareResponse> {
   const d = await deps(ctx);
   const now = d.now();
-  rate(`prepare:ip:${ctx.ip ?? 'unknown'}`, RATE.prepareIp, now, 'launch attempts from this network');
+  rateOnce(body, `prepare:ip:${ctx.ip ?? 'unknown'}`, RATE.prepareIp, now, 'launch attempts from this network');
 
   const req = (body && typeof body === 'object' ? body : {}) as { payload?: unknown; signature?: unknown };
   const problems = validateLaunchPayload(req.payload);
@@ -219,6 +230,7 @@ export async function prepareLaunch(body: unknown, ctx: LaunchCtx = {}): Promise
   rate(`prepare:owner:${raw.owner}`, RATE.prepareOwner, now, 'launch attempts for this wallet');
 
   const payload = sanitise(raw);
+  if (payload.name.length < LIMITS.name.min) throw new LaunchError(`Name must be ${LIMITS.name.min}–${LIMITS.name.max} characters.`, 400);
   const id = randomBytes(12).toString('base64url');
   const expiresAt = now + LIMITS.reservationMs;
 
@@ -278,7 +290,7 @@ export async function prepareLaunch(body: unknown, ctx: LaunchCtx = {}): Promise
 export async function confirmLaunch(id: string, body: unknown, ctx: LaunchCtx = {}): Promise<LaunchStatusResponse> {
   const d = await deps(ctx);
   if (!ID_RE.test(id)) throw new LaunchError('Launch not found.', 404);
-  rate(`confirm:ip:${ctx.ip ?? 'unknown'}`, RATE.confirmIp, d.now(), 'requests');
+  rateOnce(body, `confirm:ip:${ctx.ip ?? 'unknown'}`, RATE.confirmIp, d.now(), 'requests');
   const sigRaw = body && typeof body === 'object' ? (body as { signature?: unknown }).signature : undefined;
   if (sigRaw !== undefined && sigRaw !== null && (typeof sigRaw !== 'string' || !SIG_RE.test(sigRaw))) throw new LaunchError('That is not a transaction signature.', 400);
   const paySig = typeof sigRaw === 'string' ? sigRaw : undefined;
@@ -300,6 +312,7 @@ export async function confirmLaunch(id: string, body: unknown, ctx: LaunchCtx = 
 }
 
 async function advance(d: Deps, l: LaunchRecord, paySig?: string): Promise<LaunchRecord> {
+  if (l.state === 'live') return stepDevRetry(d, l);
   if (l.state === 'reserved' || (l.state === 'expired' && paySig)) {
     l = await stepPay(d, l, paySig);
     if (l.state !== 'paid') return l;
@@ -477,9 +490,17 @@ async function stepCreate(d: Deps, l: LaunchRecord): Promise<LaunchRecord> {
   } catch (e) {
     return failStep(d, l, `Could not check the coin on chain: ${errText(e)}`, {}, false);
   }
-  const mint = keypairFromEnc(l.mintSecretEnc);
-  if (mint.publicKey.toBase58() !== l.mintPubkey) throw new LaunchError('The stored mint key does not match.', 500);
-  const queen = await queenKeypair(d, l);
+  let mint: Keypair;
+  let queen: Keypair;
+  try {
+    mint = keypairFromEnc(l.mintSecretEnc);
+    if (mint.publicKey.toBase58() !== l.mintPubkey) throw new Error('The stored mint key does not match.');
+    queen = await queenKeypair(d, l);
+  } catch (e) {
+    // e.g. encrypted with another key (QUEEN_KEY_SECRET changed): counted like any failed step, so
+    // the launch ends up failed (cell released, refundable once the key is back) instead of stuck here.
+    return failStep(d, l, `The keys for this launch could not be read on this server: ${errText(e)}`);
+  }
   const chain = await d.chain();
   try {
     const { signature } = await chain.createCoin({ creator: queen, mint, name: l.payload.name, symbol: l.payload.ticker, uri: l.metadataUri ?? '', devBuySol: l.payload.devBuy });
@@ -495,6 +516,34 @@ async function stepCreate(d: Deps, l: LaunchRecord): Promise<LaunchRecord> {
   }
 }
 
+/**
+ * The dev-buy amount (raw units) a launch's queen received, in db meta (the launch record has no field
+ * for it). Read at the first balance read in 'created', before the hive is live: nothing else can have
+ * touched her balance of this coin yet.
+ */
+const devAmountKey = (id: string) => `launch:devAmount:${id}`;
+
+/**
+ * Send the owner's dev-buy tokens from the queen wallet ('created' only). Returns the signature, or
+ * null when nothing is owed. Balance is the source of truth: a transfer moves the whole dev buy at once,
+ * so a balance below the recorded amount means an earlier transfer already landed.
+ */
+async function sendDevTokens(d: Deps, l: LaunchRecord): Promise<string | null> {
+  const chain = await d.chain();
+  const queen = await queenKeypair(d, l);
+  const bal = await chain.tokenBalance(l.queenWallet, l.mintPubkey);
+  const raw = await d.db.getMeta(devAmountKey(l.id));
+  let owed = raw && /^\d+$/.test(raw) ? BigInt(raw) : null;
+  if (owed === null) {
+    if (bal.amount <= 0n) return null;
+    owed = bal.amount;
+    await d.db.setMeta(devAmountKey(l.id), owed.toString());
+  }
+  if (owed <= 0n || bal.amount < owed) return null;
+  const r = await chain.transferTokens({ from: queen, mint: l.mintPubkey, to: l.owner, amount: owed });
+  return r.signature;
+}
+
 /** created → live: dev-buy tokens to the owner (live), then the hive appears on the comb for everyone. */
 async function stepLive(d: Deps, l: LaunchRecord): Promise<LaunchRecord> {
   const chain = await d.chain();
@@ -503,17 +552,24 @@ async function stepLive(d: Deps, l: LaunchRecord): Promise<LaunchRecord> {
 
   if (d.mode === 'live' && p.devBuy > 0 && !l.txs.devTransfer && isBase58Address(l.owner)) {
     try {
-      const queen = await queenKeypair(d, l);
-      const bal = await chain.tokenBalance(l.queenWallet, l.mintPubkey);
-      // Balance is the source of truth: 0 means an earlier transfer already landed.
-      if (bal.amount > 0n) {
-        const r = await chain.transferTokens({ from: queen, mint: l.mintPubkey, to: l.owner, amount: bal.amount });
-        l = await cas(d, l, { txs: { ...l.txs, devTransfer: r.signature } }, ['created']);
+      const sig = await sendDevTokens(d, l);
+      if (sig) {
+        l = await cas(d, l, { txs: { ...l.txs, devTransfer: sig } }, ['created']);
         if (l.state !== 'created') return l;
       }
     } catch (e) {
       if (l.attempts + 1 < MAX_ATTEMPTS) return failStep(d, l, `Sending your dev-buy tokens failed: ${errText(e)} Retry to try again.`, {}, false);
-      note = `Your dev-buy tokens could not be sent (${errText(e)}). They are still in the ${theme.agent} wallet.`;
+      // Go live anyway (the coin exists and earns) with the tokens still owed: the queen engine sends
+      // them in her next hour (or a later confirm does). Recorded before the hive appears.
+      const amount = await d.db.getMeta(devAmountKey(l.id));
+      await writeDevOwed(d.db, l.mintPubkey, {
+        owner: l.owner,
+        amount: amount && /^\d+$/.test(amount) ? amount : undefined,
+        launchId: l.id,
+        // the last transfer timed out: it may still land, so nothing is sent again before it cannot
+        unsureAt: e instanceof TxError && e.landed === undefined ? d.now() : undefined,
+      });
+      note = `Your dev-buy tokens could not be sent yet (${errText(e)}). They are still in the ${theme.agent} wallet and are sent to you automatically within the hour.`;
     }
   }
 
@@ -563,6 +619,31 @@ async function stepLive(d: Deps, l: LaunchRecord): Promise<LaunchRecord> {
   return cas(d, l, { state: 'live', attempts: 0, error: note ?? NO_ERROR }, ['created']);
 }
 
+/**
+ * live: deliver dev-buy tokens that could not be sent before the launch went live (the hourly engine
+ * does too; see deliverDevTokens). The queen runs her hours by now, so nothing is sent while the engine
+ * is working on her (a run in progress, an hour open, or a seal whose bought tokens are not burned yet).
+ */
+async function stepDevRetry(d: Deps, l: LaunchRecord): Promise<LaunchRecord> {
+  if (d.mode !== 'live' || l.txs.devTransfer) return l;
+  if (!(await readDevOwed(d.db, l.mintPubkey))) return l;
+  const busy = `Your dev-buy tokens are still in the ${theme.agent} wallet; she is busy right now. They are sent within the hour, or retry in a few minutes.`;
+  const busyUntil = Number(await d.db.getMeta(ENGINE_META.busy(d.mode, 'hourly')).catch(() => null));
+  const st = await readHiveState(d.db, l.mintPubkey).catch(() => null);
+  if (!st || st.open || st.sealPending || (Number.isFinite(busyUntil) && busyUntil > Date.now())) return { ...l, error: busy };
+  try {
+    const chain = await d.chain();
+    const queen = await queenKeypair(d, l);
+    const r = await deliverDevTokens({ db: d.db, chain, queen, queenWallet: l.queenWallet, ca: l.mintPubkey, now: d.now() });
+    if (r.waitMs !== undefined) {
+      return { ...l, error: `Your dev-buy tokens are still in the ${theme.agent} wallet: an earlier transfer could still land. Retry in ${Math.ceil(r.waitMs / 1000)} s.` };
+    }
+    return cas(d, l, { error: NO_ERROR, ...(r.signature ? { txs: { ...l.txs, devTransfer: r.signature } } : {}) }, ['live']);
+  } catch (e) {
+    return cas(d, l, { error: `Sending your dev-buy tokens failed: ${errText(e)} They are still in the ${theme.agent} wallet; retry to try again.` }, ['live']);
+  }
+}
+
 /* ================================================================== */
 /* status                                                              */
 /* ================================================================== */
@@ -600,7 +681,7 @@ async function toStatus(db: Db, l: LaunchRecord): Promise<LaunchStatusResponse> 
 export async function refundLaunch(id: string, body: unknown, ctx: LaunchCtx = {}): Promise<LaunchStatusResponse> {
   const d = await deps(ctx);
   if (!ID_RE.test(id)) throw new LaunchError('Launch not found.', 404);
-  rate(`refund:ip:${ctx.ip ?? 'unknown'}`, RATE.refundIp, d.now(), 'refund requests');
+  rateOnce(body, `refund:ip:${ctx.ip ?? 'unknown'}`, RATE.refundIp, d.now(), 'refund requests');
   let l = await d.db.getLaunch(id);
   if (!l) throw new LaunchError('Launch not found.', 404);
   if (l.state === 'refunded') return toStatus(d.db, l);
@@ -630,8 +711,18 @@ export async function refundLaunch(id: string, body: unknown, ctx: LaunchCtx = {
           // A payment signature we hold: it must verify (and belong to this launch) first.
           if ((await d.db.getMeta(`payment:${sig}`)) !== l.id) {
             const check = await chain.verifyPayment(sig, l.owner, l.queenWallet, l.lamports, l.createdAt);
-            if (!check.ok) throw new LaunchError(check.retry ? 'Your payment is not confirmed yet. Try again shortly.' : check.reason ?? 'No valid payment found.', 409);
-            if (!(await claimPayment(d, sig, l.id))) throw new LaunchError('That payment belongs to another launch.', 409);
+            if (check.ok) {
+              if (!(await claimPayment(d, sig, l.id))) throw new LaunchError('That payment belongs to another launch.', 409);
+            } else {
+              // Not found yet: it may still land while its blockhash lives (or the RPC lags), so wait.
+              // Once it no longer can (or it is final and not a payment for this launch), the
+              // signature says nothing more: a dropped payment that was sent again, with the new
+              // signature never reaching us, must not block the refund forever. The balance decides,
+              // as for an expired launch with no signature on record.
+              const wait = check.retry ? l.updatedAt + PAYMENT_SETTLE_MS - d.now() : 0;
+              if (wait > 0) throw new LaunchError('Your payment is not confirmed yet. Try again shortly.', 409, undefined, wait);
+              unrecordedPayment = true;
+            }
           }
         } else {
           // The confirm that carried the signature may never have reached us (tab closed, page reloaded
@@ -663,7 +754,13 @@ export async function refundLaunch(id: string, body: unknown, ctx: LaunchCtx = {
       }
     }
 
-    const queen = await queenKeypair(d, l);
+    const queenWallet = l.queenWallet;
+    const queen = await queenKeypair(d, l).catch((e: unknown) => {
+      // Mock mode only: a key this server cannot read (another dev key encrypted it) does not block a
+      // simulated refund. MockChain identifies wallets by public key and never signs.
+      if (d.mode === 'mock' && chain.kind === 'mock') return { publicKey: new PublicKey(queenWallet), secretKey: new Uint8Array(64) } as unknown as Keypair;
+      throw e;
+    });
     const balance = await chain.balance(l.queenWallet);
     const lamports = balance - BASE_FEE_LAMPORTS;
     // Nothing arrived (yet): stay expired so a payment that lands later can still be refunded. With a
@@ -696,18 +793,84 @@ export async function refundLaunch(id: string, body: unknown, ctx: LaunchCtx = {
 /** Largest launch request body we read (a 400 KB image is ~540 KB as base64 JSON). */
 export const MAX_BODY_BYTES = 1024 * 1024;
 
-/** Read a JSON body with a size cap. Throws LaunchError(400/413). Empty body → {}. */
-export async function readJson(req: Request): Promise<unknown> {
-  const len = Number(req.headers.get('content-length') ?? 0);
-  if (len > MAX_BODY_BYTES) throw new LaunchError('Request is too large.', 413);
-  const text = await req.text();
-  if (text.length > MAX_BODY_BYTES * 1.1) throw new LaunchError('Request is too large.', 413);
-  if (!text.trim()) return {};
+/** Bodies whose request already counted against its route's per-IP rate limit (in readJson). */
+const rateCounted = new WeakSet<object>();
+
+/** The per-IP limit of the launch route a request is for (by path), or null for any other path. */
+function routeRate(req: Request): { key: string; r: { limit: number; windowMs: number }; what: string } | null {
+  let path: string;
   try {
-    return JSON.parse(text) as unknown;
+    path = new URL(req.url).pathname;
   } catch {
-    throw new LaunchError('Request body must be JSON.', 400);
+    return null;
   }
+  const ip = clientIp(req.headers);
+  if (/^\/api\/launch\/?$/.test(path)) return { key: `prepare:ip:${ip}`, r: RATE.prepareIp, what: 'launch attempts from this network' };
+  if (/^\/api\/launch\/[^/]+\/confirm\/?$/.test(path)) return { key: `confirm:ip:${ip}`, r: RATE.confirmIp, what: 'requests' };
+  if (/^\/api\/launch\/[^/]+\/refund\/?$/.test(path)) return { key: `refund:ip:${ip}`, r: RATE.refundIp, what: 'refund requests' };
+  return null;
+}
+
+/**
+ * Read a JSON body with a size cap. Throws LaunchError(400/413/429). Empty or non-object body → {}.
+ * A declared Content-Length over the cap is refused before anything is read, the launch routes' per-IP
+ * rate limit is applied next (still before the body: a limited client is not read at all; the handler
+ * then does not count the same request twice), and the body is streamed and abandoned as soon as it
+ * passes MAX_BODY_BYTES, so a chunked upload without a Content-Length is never buffered beyond the cap.
+ */
+export async function readJson(req: Request): Promise<unknown> {
+  const declared = req.headers.get('content-length');
+  if (declared !== null) {
+    const len = Number(declared);
+    if (!/^\s*\d+\s*$/.test(declared) || !Number.isSafeInteger(len)) throw new LaunchError('Invalid Content-Length.', 400);
+    if (len > MAX_BODY_BYTES) throw new LaunchError('Request is too large.', 413);
+  }
+  const limit = routeRate(req);
+  if (limit) rate(limit.key, limit.r, Date.now(), limit.what);
+  const bytes = await readCapped(req, MAX_BODY_BYTES);
+  const text = new TextDecoder().decode(bytes);
+  let body: unknown = {};
+  if (text.trim()) {
+    try {
+      body = JSON.parse(text) as unknown;
+    } catch {
+      throw new LaunchError('Request body must be JSON.', 400);
+    }
+  }
+  // the handlers ignore anything but an object; a fresh {} can carry the rate-limit mark
+  const out = body && typeof body === 'object' ? body : {};
+  if (limit) rateCounted.add(out);
+  return out;
+}
+
+/** The request body, at most `max` bytes; the stream is cancelled as soon as it passes that. */
+async function readCapped(req: Request, max: number): Promise<Uint8Array> {
+  if (!req.body) return new Uint8Array(0);
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    let r: ReadableStreamReadResult<Uint8Array>;
+    try {
+      r = await reader.read();
+    } catch {
+      throw new LaunchError('Could not read the request body.', 400);
+    }
+    if (r.done) break;
+    total += r.value.byteLength;
+    if (total > max) {
+      await reader.cancel().catch(() => {});
+      throw new LaunchError('Request is too large.', 413);
+    }
+    chunks.push(r.value);
+  }
+  return Buffer.concat(chunks);
+}
+
+/** Count a request against a per-IP limit, unless readJson already did for this body. */
+function rateOnce(body: unknown, key: string, r: { limit: number; windowMs: number }, now: number, what: string) {
+  if (body && typeof body === 'object' && rateCounted.has(body)) return;
+  rate(key, r, now, what);
 }
 
 /** Map any error to a JSON response. Unexpected errors are logged (message only) and hidden. */

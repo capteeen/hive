@@ -1,6 +1,6 @@
 'use client';
 /**
- * Ambient life on every page: money splashes and a bee flying by now and then.
+ * Ambient life on every page: money splashes and, for the hive theme, a bee flying by now and then.
  *
  * - Client-only: the effects are dynamic imports with ssr: false, and nothing renders before mount.
  * - Renders nothing under prefers-reduced-motion (and globals.css hides `.fx-layer` there too).
@@ -8,13 +8,21 @@
  *   which clears their timers and animation frames; they start fresh when shown again.
  * - One fixed overlay (`.fx-layer`, z-index 35: above the page, below the nav and modals) with
  *   pointer-events: none; only the coins and the bee catch clicks.
+ * - The flying creature (its drawing and its buzz) belongs to the theme: only `hive` has one, so a
+ *   swapped theme (pack: wolves and dens) keeps the money splashes and flies nothing.
  */
 import dynamic from 'next/dynamic';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ComponentType } from 'react';
 import { useUI } from '@/lib/ui';
+import { theme } from '@/themes';
 
 const MoneySplash = dynamic(() => import('./MoneySplash'), { ssr: false });
 const FlyingBee = dynamic(() => import('./FlyingBee'), { ssr: false });
+
+/** The ambient creature of each theme, by theme id. */
+const CRITTERS: Record<string, ComponentType> = { hive: FlyingBee };
+export const critterFor = (themeId: string): ComponentType | null => CRITTERS[themeId] ?? null;
+const Critter = critterFor(theme.id);
 
 export default function Ambient() {
   const [visible, setVisible] = useState(false);
@@ -41,7 +49,7 @@ export default function Ambient() {
   return (
     <div className="fx-layer" aria-hidden="true">
       <MoneySplash />
-      <FlyingBee />
+      {Critter && <Critter />}
     </div>
   );
 }

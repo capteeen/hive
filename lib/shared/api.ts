@@ -87,6 +87,8 @@ export interface HivesResponse {
   actions: RemoteAction[];
   harvests: RemoteHarvest[];
   serverTime: number;
+  /** Hives left out because the list is capped (abandoned and oldest first). */
+  omitted?: number;
 }
 
 /* ---------- launching ---------- */
@@ -154,7 +156,7 @@ export const LIMITS = {
   description: 500,
   motto: 80,
   link: 200,
-  imageBytes: 400 * 1024,
+  imageBytes: 200 * 1024,
   maxDevBuy: 10,
   /** Reservations expire if the payment never arrives. */
   reservationMs: 15 * 60 * 1000,

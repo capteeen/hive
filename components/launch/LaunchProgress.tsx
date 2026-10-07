@@ -81,6 +81,10 @@ export default function LaunchProgress(p: LaunchProgressProps) {
   const expiresIn = r && s?.state === 'reserved' && !s.txs.payment && now ? Math.max(0, r.expiresAt - now) : null;
   const refundable = !!s && (s.state === 'failed' || (s.state === 'expired' && (!!s.txs.payment || !!p.stranded)));
   const canRetry = !!p.onRetry && !stopped && s?.state !== 'live' && !!problem && !p.canPay;
+  // Nothing is following the launch and nothing is wrong, yet it is not finished: the wizard's polling
+  // gave up (offline, a sleeping tab, a phone left in the wallet app). Offer to check on it again.
+  const stalled = !p.busy && p.phase === 'confirm' && !stopped && s?.state !== 'live' && !problem && !p.canPay;
+  const canCheck = stalled && !!p.onRetry;
 
   const tx = (sig: string | undefined, label: string) =>
     !sig ? null : live ? (
@@ -141,9 +145,11 @@ export default function LaunchProgress(p: LaunchProgressProps) {
         ? 'Reserving your cell…'
         : p.phase === 'pay' && !p.canPay
           ? 'Approve the transfer in your wallet.'
-          : waitingPayment
-            ? 'Waiting for the payment to confirm…'
-            : null;
+          : stalled
+            ? 'No word from the server for a while. The launch is saved: check again to carry on.'
+            : waitingPayment
+              ? 'Waiting for the payment to confirm…'
+              : null;
 
   return (
     <section aria-live="polite">
@@ -163,7 +169,7 @@ export default function LaunchProgress(p: LaunchProgressProps) {
               <span
                 className={`shape-hex flex h-8 w-8 shrink-0 items-center justify-center text-xs font-semibold ${
                   st === 'done' ? 'bg-soft/80 text-night' : st === 'active' ? 'bg-accent text-night' : st === 'failed' ? 'bg-raid text-night' : 'bg-text/10 text-text/60'
-                } ${st === 'active' && (p.busy || p.phase !== 'done') && !problem ? 'animate-pulse' : ''}`}
+                } ${st === 'active' && (p.busy || p.phase !== 'done') && !problem && !stalled ? 'animate-pulse' : ''}`}
                 aria-hidden
               >
                 {icon}
@@ -171,7 +177,7 @@ export default function LaunchProgress(p: LaunchProgressProps) {
               <div className="min-w-0 text-sm">
                 <div className="flex flex-wrap items-baseline gap-x-2 font-heading font-semibold">
                   {label}
-                  <span className="text-xs font-normal text-text/50">{st === 'done' ? 'done' : st === 'active' ? (problem ? 'needs you' : 'in progress') : st === 'failed' ? 'stopped' : st === 'skipped' ? 'skipped' : ''}</span>
+                  <span className="text-xs font-normal text-text/50">{st === 'done' ? 'done' : st === 'active' ? (problem ? 'needs you' : stalled ? 'waiting' : 'in progress') : st === 'failed' ? 'stopped' : st === 'skipped' ? 'skipped' : ''}</span>
                 </div>
                 <div className="mt-0.5 break-words text-xs leading-relaxed text-text/65">{detail[i]}</div>
                 {st === 'active' && activeText && i === cur && <div className="mt-1 text-xs font-semibold text-accent">{activeText}</div>}
@@ -207,6 +213,11 @@ export default function LaunchProgress(p: LaunchProgressProps) {
         {canRetry && (
           <button onClick={p.onRetry} disabled={p.busy} className={`shape-btn btn-honey h-10 font-heading text-sm font-semibold ${p.busy ? 'opacity-60' : ''}`}>
             {p.busy ? 'Working…' : 'Retry'}
+          </button>
+        )}
+        {canCheck && (
+          <button onClick={p.onRetry} className="shape-btn btn-honey h-10 font-heading text-sm font-semibold">
+            Check again
           </button>
         )}
         {refundable && p.onRefund && (

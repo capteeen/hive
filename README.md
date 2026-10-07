@@ -67,7 +67,7 @@ they are real records on the server, so every visitor sees every hive appear on 
 
 ```
 npm run dev                 # mock mode, file store under .data/, live feed over SSE
-npm test                    # 188 unit/integration tests (vitest)
+npm test                    # unit/integration tests (vitest)
 bash scripts/test-sql.sh    # the Supabase schema on a throwaway Postgres 16 (93 assertions)
 ```
 
@@ -79,6 +79,13 @@ bash scripts/test-sql.sh    # the Supabase schema on a throwaway Postgres 16 (93
   otherwise Server-Sent Events from `/api/stream`. New hives play the founding animation for everyone.
 - Your own hives are the ones whose owner is your connected wallet (or, in mock mode without a
   wallet, an anonymous id stored in your browser).
+- `/api/hives` carries at most 1,000 hives (abandoned, then the oldest, are left out first; their
+  cells stay taken) and may be cached by a CDN for 5 s. Uploaded (data-URL) hive images are not in the
+  list: they are stored separately (Supabase `meta` row `image:<ca>`, or `DATA_DIR/images/`) and served
+  by `/api/hives/[ca]/image`.
+- `/api/stream` allows 200 connections per server process and 6 per identifiable client address, and
+  drops a connection that stops reading (512 KB unread). Browsers then fall back to re-fetching the list.
+  With Supabase but no anon key, the stream polls the database every few seconds instead of Realtime.
 
 **On Vercel you need Supabase for real multi-user.** Serverless instances do not share `/tmp`, so the
 file store is only for local development and single-server deployments. Setup:
@@ -95,7 +102,8 @@ The wizard (Queen look → Temperament → Rules → Coin → Dev buy + launch) 
    queen's wallet.
 3. `POST /api/launch/[id]/confirm`: verifies the payment on chain, uploads the image and metadata to
    IPFS (pump.fun), creates the coin through PumpPortal with the queen as creator (plus the optional
-   dev buy, whose tokens are sent to your wallet), and publishes the hive. Every step is idempotent and
+   dev buy, whose tokens are sent to your wallet; if that transfer fails, the hourly engine sends them,
+even in dry-run), and publishes the hive. Every step is idempotent and
    resumable; closing the tab and coming back resumes the launch. Failed launches can be refunded.
 
 ### The queen engine
@@ -121,14 +129,15 @@ In live mode the engine only **records** what it would do (`dryRun`) until you s
 | `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | unset | Supabase (required for live mode and for multi-user on Vercel) |
 | `SOLANA_RPC_URL` | public mainnet RPC | server RPC (use a paid one for live) |
 | `NEXT_PUBLIC_RPC` | public mainnet RPC | the wallet's RPC in the browser |
-| `QUEEN_KEY_SECRET` | dev key in `DATA_DIR` | 32-byte key (base64 or hex) that encrypts queen and mint keys; **required in live mode** |
+| `QUEEN_KEY_SECRET` | mock only: a dev key in `DATA_DIR`, or derived from `SUPABASE_SERVICE_ROLE_KEY` (HKDF-SHA256) when Supabase is configured | 32-byte key (base64 or hex) that encrypts queen and mint keys; **required in live mode** |
 | `CRON_SECRET` | unset | bearer token for the cron routes (unset = only allowed in mock mode) |
 | `ENGINE_DRY_RUN` | `1` | live mode: record actions without sending |
 | `HUB_WALLET`, `HUB_WALLET_SECRET`, `HUB_TOKEN_MINT` | unset | the harvest wallet and the $HIVE mint |
-| `HELIUS_API_KEY` | unset | holder counts (bees) via Helius DAS |
+| `HELIUS_API_KEY` | unset | holder counts (bees) and the holder list for abandon payouts, via Helius DAS |
 | `PRIORITY_FEE_SOL`, `SLIPPAGE_PCT` | `0.0005`, `10` | trade settings |
 | `NEXT_PUBLIC_DEMO_HIVES` | `1` | show the 60 simulated demo hives |
 | `DATA_DIR` | `.data` (`/tmp/hive-data` on Vercel) | file store location |
+| `TRUST_PROXY` | unset | how many reverse proxies to trust for the client address (`X-Forwarded-For`). Ignored on Vercel, which sets it reliably. Unset on a self-hosted server: every client shares one rate-limit bucket (12 launch prepares per 10 min, 40 confirms/min, 120 status reads/min, 10 refunds per 10 min), so set it to `1` behind nginx/Caddy |
 
 ### Before turning on live mode
 
@@ -137,6 +146,12 @@ In live mode the engine only **records** what it would do (`dryRun`) until you s
 - Fund nothing until a full launch has been run end to end on mainnet with a small dev buy.
 - `GET /api/config` shows the mode; `liveModeProblems()` refuses live launches until the required
   env vars are set.
+- PumpPortal transactions are checked before the queen signs them: only ComputeBudget, System, SPL
+  Token / Token-2022, Associated Token, pump and PumpSwap programs are allowed, the priority fee is
+  capped at 2 × `PRIORITY_FEE_SOL`, and a buy may not spend more than asked. If PumpPortal starts adding
+  another program (a memo or a tip), trades fail safe until it is added to the allow-list.
+- Abandon payouts need `HELIUS_API_KEY`: without a complete holder list, a starving hive waits and
+  retries every hour instead of paying. Past 100 holders, the 100 largest share the vault pro rata.
 
 ## Phase 2 notes (historical)
 
