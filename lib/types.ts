@@ -41,6 +41,12 @@ export interface Hive {
   /** mock: holders the hive had before starving started (for decay display). */
   beesPeak: number;
   priceHistory: PricePoint[];
+  /** 'demo': simulated in this browser. 'remote': stored server-side, the same for every user. */
+  source?: 'demo' | 'remote';
+  /** Remote hives: 'mock' launch or a real 'live' pump.fun coin. */
+  status?: 'mock' | 'live';
+  ownerWallet?: string;
+  createTx?: string;
   /** Set for hives founded through the wizard. */
   look?: QueenLook;
   rules?: QueenRules;

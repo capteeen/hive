@@ -83,7 +83,7 @@ export function feeGrowth(h: Hive) {
 }
 
 /* ---------- world creation ---------- */
-export function createWorld(seed = SEED, now = Date.now()): World {
+export function createWorld(seed = SEED, now = Date.now(), demo = true): World {
   const rng = mulberry32(seed);
   const cells = spiral(SEED_HIVES);
   const used = new Set<string>();
@@ -101,6 +101,8 @@ export function createWorld(seed = SEED, now = Date.now()): World {
     seq: 0,
     biggestCa: '',
   };
+
+  if (!demo) return world; // only server-side (remote) hives
 
   // Index 0 is the biggest (centered). A handful are starving/abandoned on load.
   for (let i = 0; i < SEED_HIVES; i++) {
@@ -231,7 +233,7 @@ function biggest(world: World) {
   let best: Hive | undefined;
   for (const ca of world.order) {
     const h = world.hives[ca];
-    if (h.state === 'abandoned') continue;
+    if (h.state === 'abandoned' || h.source === 'remote') continue;
     if (!best || h.honey > best.honey) best = h;
   }
   return best;
@@ -262,14 +264,14 @@ function swarmTarget(world: World, h: Hive): Hive | undefined {
   const adj = new Set(neighbors(h.cell).map(cellKey));
   for (const ca of world.order) {
     const o = world.hives[ca];
-    if (o.ca === h.ca || o.state !== 'working') continue;
+    if (o.ca === h.ca || o.state !== 'working' || o.source === 'remote') continue;
     if (adj.has(cellKey(o.cell))) candidates.push(o);
   }
   if (!candidates.length) {
     // fall back to the nearest working hives within distance 3
     for (const ca of world.order) {
       const o = world.hives[ca];
-      if (o.ca === h.ca || o.state !== 'working') continue;
+      if (o.ca === h.ca || o.state !== 'working' || o.source === 'remote') continue;
       if (hexDistance(o.cell, h.cell) <= 3) candidates.push(o);
     }
   }
@@ -392,6 +394,7 @@ function runHarvest(world: World, now: number, rng: Rng) {
   // roll hourly averages
   for (const ca of world.order) {
     const h = world.hives[ca];
+    if (h.source === 'remote') continue;
     const w = feeWindows(ca, now);
     h.feesHour = w.hour;
     h.feesPrevHour = w.prev;
@@ -404,7 +407,7 @@ function runStarvation(world: World, now: number, rng: Rng) {
   const rules = theme.rules;
   for (const ca of world.order) {
     const h = world.hives[ca];
-    if (h.state === 'abandoned') continue;
+    if (h.state === 'abandoned' || h.source === 'remote') continue; // remote hives starve server-side
     const silent = (now - h.lastFeeAt) / HOUR_MS;
     if (h.state === 'working' && silent >= rules.starveHours) {
       h.state = 'starving';
@@ -443,7 +446,7 @@ export function stepWorld(world: World, clock: SimClock, now = Date.now()): bool
     changed = true;
     clock.nextFeeAt = now + 2000 + rng() * 3000;
     const n = 1 + Math.floor(rng() * 3);
-    const working = world.order.filter((ca) => world.hives[ca].state !== 'abandoned');
+    const working = world.order.filter((ca) => world.hives[ca].state !== 'abandoned' && world.hives[ca].source !== 'remote');
     for (let i = 0; i < n; i++) {
       // weighted by vigor
       const total = working.reduce((s, ca) => s + world.hives[ca].vigor, 0);
@@ -475,6 +478,11 @@ export function stepWorld(world: World, clock: SimClock, now = Date.now()): bool
 }
 
 /* ---------- empty cells ---------- */
+/** Cells the simulated demo hives occupy (the same in every browser and on the server). */
+export function demoCells(): Cell[] {
+  return spiral(SEED_HIVES);
+}
+
 export function occupiedKeys(world: World) {
   return new Set(world.order.map((ca) => cellKey(world.hives[ca].cell)));
 }
