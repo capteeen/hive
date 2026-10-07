@@ -34,6 +34,21 @@ export interface LaunchRecord {
   attempts: number;
 }
 
+export interface ListOpts {
+  /** Only what was really sent: no dry-run rows. */
+  real?: boolean;
+}
+
+/**
+ * `liveOnly` (live launch mode): preview data never blocks a real launch. Hives with status 'mock' and
+ * claims held by mock-mode launches do not count as taken, and claiming a cell replaces a mock launch's
+ * claim on it. A live database can hold such rows from before go-live (supabase/cleanup-fake-data.sql
+ * removes them) or from a mock deployment sharing it.
+ */
+export interface CellScope {
+  liveOnly?: boolean;
+}
+
 export interface Db {
   readonly kind: 'file' | 'supabase';
 
@@ -41,9 +56,10 @@ export interface Db {
   getHive(ca: string): Promise<RemoteHive | null>;
   upsertHive(h: RemoteHive): Promise<void>;
 
-  listActions(limit: number, ca?: string): Promise<RemoteAction[]>;
+  /** Newest first. `opts.real`: leave out dry runs (live mode's public feed). */
+  listActions(limit: number, ca?: string, opts?: ListOpts): Promise<RemoteAction[]>;
   addAction(a: RemoteAction): Promise<void>;
-  listHarvests(limit: number): Promise<RemoteHarvest[]>;
+  listHarvests(limit: number, opts?: ListOpts): Promise<RemoteHarvest[]>;
   addHarvest(h: RemoteHarvest): Promise<void>;
 
   /**
@@ -51,12 +67,12 @@ export interface Db {
    * frontier cells by the caller) and returns the first one it could claim, or null if none.
    * A claim made with `expiresAt` lapses unless `finalizeCell` is called; expired claims are free again.
    */
-  claimCell(candidates: Cell[], launchId: string, expiresAt: number): Promise<Cell | null>;
+  claimCell(candidates: Cell[], launchId: string, expiresAt: number, scope?: CellScope): Promise<Cell | null>;
   /** Make a launch's claim permanent (the hive is live). */
   finalizeCell(launchId: string): Promise<void>;
   releaseCell(launchId: string): Promise<void>;
   /** Cells taken by hives or by unexpired claims. */
-  takenCells(now: number): Promise<Cell[]>;
+  takenCells(now: number, scope?: CellScope): Promise<Cell[]>;
 
   createLaunch(l: LaunchRecord): Promise<void>;
   getLaunch(id: string): Promise<LaunchRecord | null>;

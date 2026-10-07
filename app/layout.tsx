@@ -4,6 +4,8 @@ import Providers from './providers';
 import Nav from '@/components/Nav';
 import Footer from '@/components/Footer';
 import Ambient from '@/components/fx/Ambient';
+import { HoneyBackdrop, HoneyPool } from '@/components/fx/Honey';
+import { ambienceOf } from '@/components/fx/swarmModel';
 import { theme } from '@/themes';
 import { themeCss } from '@/lib/themeCss';
 
@@ -13,9 +15,11 @@ export const metadata: Metadata = {
   openGraph: { title: theme.name, description: theme.copy.tagline, type: 'website' },
 };
 
+const honey = ambienceOf(theme).honey;
+
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en" data-mode="night" data-shape={theme.shape} suppressHydrationWarning>
+    <html lang="en" data-mode="night" data-shape={theme.shape} data-honey={honey ? 'on' : undefined} suppressHydrationWarning>
       <head>
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
@@ -26,11 +30,20 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <style dangerouslySetInnerHTML={{ __html: themeCss() }} />
       </head>
       <body className="min-h-screen antialiased">
+        {/* honeycomb texture and warm glow behind every page (static) */}
+        {honey && <HoneyBackdrop />}
         <Providers>
           <Nav />
           <main className="min-h-screen">{children}</main>
-          <Footer />
-          {/* money splashes + a passing bee; client-only, renders nothing on the server */}
+          {honey ? (
+            <div className="relative">
+              <HoneyPool />
+              <Footer />
+            </div>
+          ) : (
+            <Footer />
+          )}
+          {/* money splashes, the swarm and honey on click; client-only, renders nothing on the server */}
           <Ambient />
         </Providers>
       </body>

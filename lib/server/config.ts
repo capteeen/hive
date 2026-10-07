@@ -47,17 +47,25 @@ export const config = {
   /** The hourly engine only records what it would do unless this is explicitly off. */
   engineDryRun: flag('ENGINE_DRY_RUN', true),
   cronSecret: env('CRON_SECRET'),
-  demoHives: flag('NEXT_PUBLIC_DEMO_HIVES', true),
+  /** The 60 simulated demo hives. Off unless NEXT_PUBLIC_DEMO_HIVES is set (=1, for local play): nothing fake by default. */
+  demoHives: flag('NEXT_PUBLIC_DEMO_HIVES', false),
   costs: { launchCost: num('LAUNCH_COST_SOL', LAUNCH_COST), queenReserve: num('QUEEN_RESERVE_SOL', QUEEN_RESERVE), maxDevBuy: LIMITS.maxDevBuy },
   siteUrl: env('NEXT_PUBLIC_SITE_URL'),
 };
 
 export const hasSupabase = () => !!(config.supabase.url && config.supabase.serviceKey);
 
+/** QUEEN_KEY_SECRET's shape, as lib/server/keys.ts reads it: 64 hex chars, or base64 of 32 bytes. */
+export function queenKeyValid(raw: string): boolean {
+  if (/^[0-9a-fA-F]{64}$/.test(raw)) return true;
+  return /^[A-Za-z0-9+/_-]+={0,2}$/.test(raw) && Buffer.from(raw, 'base64').length === 32;
+}
+
 /** Problems that make live mode unsafe to run; empty means live mode is fully configured. */
 export function liveModeProblems(): string[] {
   const p: string[] = [];
   if (!config.queenKeySecret) p.push('QUEEN_KEY_SECRET is not set.');
+  else if (!queenKeyValid(config.queenKeySecret)) p.push('QUEEN_KEY_SECRET must decode to exactly 32 bytes (`openssl rand -base64 32`).');
   if (!process.env.SOLANA_RPC_URL) p.push('SOLANA_RPC_URL is not set (use a paid RPC for mainnet).');
   if (!hasSupabase()) p.push('Supabase is not configured: live mode needs a durable database, not the local file store.');
   else if (!config.supabase.anonKey) p.push('NEXT_PUBLIC_SUPABASE_ANON_KEY is not set: browsers need it to see other users\' hives in realtime.');
@@ -78,5 +86,6 @@ export function publicConfig(): PublicConfig {
     supabaseAnonKey: realtime === 'supabase' ? config.supabase.anonKey : undefined,
     demoHives: config.demoHives,
     costs: config.costs,
+    hubTokenMint: config.hubTokenMint,
   };
 }

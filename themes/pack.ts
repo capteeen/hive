@@ -46,6 +46,8 @@ export const pack: Theme = {
   },
   shape: 'circle',
   scene: 'den',
+  // wolves get no bees and no honey; the money splashes stay
+  ambience: { critter: null, honey: false },
   copy: {
     eyebrow: 'Every coin is a den. Every holder is a wolf.',
     tagline: 'Launch a coin, get an alpha. It culls, caches and hunts with your fees, every hour, on-chain.',

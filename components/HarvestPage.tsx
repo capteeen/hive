@@ -3,7 +3,8 @@ import Link from 'next/link';
 import { useEffect, useRef, useState } from 'react';
 import { useNow } from '@/lib/useNow';
 import { createChart, ColorType, type IChartApi, type Time } from 'lightweight-charts';
-import { useHive } from '@/lib/store';
+import { demoOn, useHive } from '@/lib/store';
+import { useUI } from '@/lib/ui';
 import { harvestOnChain, isServerHarvest } from '@/lib/remoteMap';
 import { theme } from '@/themes';
 import { fmtCompact, fmtSol, short, txUrl, timeAgo, addrUrl } from '@/lib/format';
@@ -23,7 +24,11 @@ export default function HarvestPage() {
   // only the live server's harvests are real transactions; unknown until /api/config has loaded
   const launchMode = useHive((s) => s.config?.launchMode);
   // the server does not publish its pool or the token price: with no demo hives there is nothing to show
-  const demo = useHive((s) => s.config?.demoHives !== false);
+  const demo = useHive((s) => demoOn(s.config));
+  // the real $HIVE mint once the server has one; the theme's placeholder only stands in for the demo
+  const hubMint = useHive((s) => s.config?.hubTokenMint ?? (demoOn(s.config) ? theme.hubToken.ca : undefined));
+  const anyHive = useHive((s) => s.world.order.length > 0);
+  const openLaunch = useUI((s) => s.openLaunch);
   const chartRef = useRef<HTMLDivElement>(null);
   const [copied, setCopied] = useState(false);
   const now = useNow(5000);
@@ -61,19 +66,27 @@ export default function HarvestPage() {
           </p>
           <div className="mt-5 flex flex-wrap items-center gap-2 text-xs">
             <span className="text-text/50">{theme.hubToken.symbol} CA</span>
-            <button
-              onClick={() => {
-                navigator.clipboard?.writeText(theme.hubToken.ca);
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1200);
-              }}
-              className="shape-btn btn-ghost inline-flex h-7 items-center font-mono text-[11px]"
-            >
-              {short(theme.hubToken.ca, 6)} {copied ? '✓' : '⧉'}
-            </button>
-            <a href={addrUrl(theme.hubToken.ca)} target="_blank" rel="noreferrer" className="text-accent/80 hover:text-accent">
-              solscan ↗
-            </a>
+            {hubMint ? (
+              <>
+                <button
+                  onClick={() => {
+                    navigator.clipboard?.writeText(hubMint);
+                    setCopied(true);
+                    setTimeout(() => setCopied(false), 1200);
+                  }}
+                  className="shape-btn btn-ghost inline-flex h-7 items-center font-mono text-[11px]"
+                >
+                  {short(hubMint, 6)} {copied ? '✓' : '⧉'}
+                </button>
+                <a href={addrUrl(hubMint)} target="_blank" rel="noreferrer" className="text-accent/80 hover:text-accent">
+                  solscan ↗
+                </a>
+              </>
+            ) : (
+              <span className="text-text/60" data-empty="hub-mint">
+                not launched yet
+              </span>
+            )}
           </div>
           <HarvestCountdown className="mt-8" />
         </div>
@@ -87,8 +100,9 @@ export default function HarvestPage() {
 
       <div className="mt-12">
         <h2 className="mb-3 font-heading text-2xl font-semibold tracking-tight">Burn per {theme.hubRitual}</h2>
-        <div className="shape-card glass p-3">
+        <div className="shape-card glass relative p-3">
           <div ref={chartRef} className="h-[240px] w-full" />
+          {!harvests.length && <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-text/50">No {theme.hubRitual} has burned anything yet.</div>}
         </div>
       </div>
 
@@ -144,6 +158,22 @@ export default function HarvestPage() {
                   </tr>
                 );
               })}
+              {!harvests.length && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8" data-empty="harvests">
+                    <div className="flex flex-wrap items-center justify-between gap-4">
+                      <p className="max-w-xl text-sm text-text/60">
+                        Nothing yet. The first {theme.hubRitual} runs on the hour once a {theme.unit} has earned fees: {Math.round(theme.feeToHub * 100)}% of them buy {theme.hubToken.symbol}, half is burned, half goes to the biggest {theme.unit}.
+                      </p>
+                      {!anyHive && (
+                        <button onClick={() => openLaunch()} data-sfx="open" className="shape-btn btn-honey h-9 text-xs font-semibold">
+                          Found the first {theme.unit}
+                        </button>
+                      )}
+                    </div>
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>

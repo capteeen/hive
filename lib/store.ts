@@ -4,6 +4,7 @@ import { createWorld, createClock, stepWorld, foundHive, computeStats, SEED, HOU
 import type { World, Hive, Action, Harvest, SceneEvent, SceneEventType, Stats } from './types';
 import type { HivesResponse, PublicConfig, RemoteAction, RemoteHarvest, RemoteHive } from './shared/api';
 import { isServerHarvest, remoteToAction, remoteToHarvest, remoteToHive } from './remoteMap';
+import { cellKey } from './hex';
 import { setSfxEnabled } from './sfx';
 
 interface Position {
@@ -50,9 +51,17 @@ interface HiveStore {
   consumeEvents: (afterId: number) => SceneEvent[];
 }
 
+/**
+ * Whether this build shows the 60 simulated demo hives before /api/config says otherwise. Next inlines
+ * NEXT_PUBLIC_DEMO_HIVES into the browser bundle at build time and the server reads the same variable, so
+ * SSR and hydration agree. Off unless set (`=1` for local play), like the server's config.demoHives: a
+ * real deployment never flashes made-up hives while the config loads.
+ */
+export const BUILD_DEMO_HIVES = ((v) => !!v && !/^(0|false|no|off)$/i.test(v))((process.env.NEXT_PUBLIC_DEMO_HIVES ?? '').trim());
+
 /** Fixed epoch so server and client hydrate identical markup; start() re-seeds with the real clock. */
 const FIXED_EPOCH = 1_760_000_000_000;
-const initialWorld = createWorld(SEED, FIXED_EPOCH);
+const initialWorld = createWorld(SEED, FIXED_EPOCH, BUILD_DEMO_HIVES);
 let clock: SimClock | null = null;
 let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -60,8 +69,36 @@ let timer: ReturnType<typeof setInterval> | null = null;
 const LIVE_HOUR_MS = 3_600_000;
 /** The server's harvest hour: real hours in live launch mode, the mock hour (sim.ts HOUR_MS) otherwise. */
 export const harvestHourMs = (cfg: PublicConfig | null) => (cfg?.launchMode === 'live' ? LIVE_HOUR_MS : HOUR_MS);
-/** The demo simulator runs until the server says demo hives are off. */
-const demoOn = (cfg: PublicConfig | null) => cfg?.demoHives !== false;
+/** Whether the simulated demo hives are shown: the server's say once /api/config has loaded, the build's until then. */
+export const demoOn = (cfg: PublicConfig | null) => (cfg ? cfg.demoHives : BUILD_DEMO_HIVES);
+
+/** Mock holdings for /me (demo only): the 2nd, 7th biggest and two abandoned demo hives. */
+const demoPositions = (order: string[]): Position[] => [
+  { ca: order[1], tokens: 12_400_000, share: 0.0124 },
+  { ca: order[6], tokens: 31_000_000, share: 0.031 },
+  { ca: order[58], tokens: 54_000_000, share: 0.054 },
+  { ca: order[59], tokens: 8_000_000, share: 0.008 },
+];
+
+/**
+ * The server turned demo hives on although this build started without them: seed them around the remote
+ * hives already loaded (a demo hive whose cell a remote hive holds is left out). Returns the demo positions.
+ */
+function addDemo(w: World, now: number): Position[] {
+  const demo = createWorld(SEED, now, true);
+  const taken = new Set(w.order.map((ca) => cellKey(w.hives[ca].cell)));
+  const kept = demo.order.filter((ca) => !taken.has(cellKey(demo.hives[ca].cell)) && !w.hives[ca]);
+  for (const ca of kept) w.hives[ca] = demo.hives[ca];
+  w.order = [...kept, ...w.order];
+  w.actions = [...demo.actions.filter((a) => !!w.hives[a.ca]), ...w.actions].sort((x, y) => y.at - x.at).slice(0, 240);
+  w.harvests = [...demo.harvests, ...w.harvests].sort((x, y) => y.at - x.at).slice(0, 120);
+  w.hubPool = demo.hubPool;
+  w.hubPrice = demo.hubPrice;
+  w.hubBurnedTotal = demo.hubBurnedTotal;
+  w.nextHarvestAt = demo.nextHarvestAt;
+  w.biggestCa = demo.biggestCa;
+  return demoPositions(demo.order);
+}
 
 /**
  * Line the simulator's next harvest up with the server. Demo off: nothing is simulated, so stepWorld must
@@ -109,7 +146,7 @@ function recomputeMine(w: World, prev: string[], ids: string[]): string[] {
 export const useHive = create<HiveStore>((set, get) => ({
   world: initialWorld,
   version: 0,
-  stats: computeStats(initialWorld),
+  stats: statsOf(initialWorld, null, FIXED_EPOCH),
   mode: 'night',
   sound: false,
   sfx: true,
@@ -125,7 +162,7 @@ export const useHive = create<HiveStore>((set, get) => ({
     const w = get().world;
     const patch: Partial<HiveStore> = {};
     // the server can turn the simulated demo hives off: keep only remote hives, and no demo hub numbers
-    if (!c.demoHives && (prev === null || prev.demoHives)) {
+    if (!c.demoHives && demoOn(prev)) {
       for (const ca of [...w.order]) if (w.hives[ca].source !== 'remote') delete w.hives[ca];
       w.order = w.order.filter((ca) => !!w.hives[ca]);
       w.actions = w.actions.filter((a) => !!w.hives[a.ca]);
@@ -135,6 +172,9 @@ export const useHive = create<HiveStore>((set, get) => ({
       w.hubPrice = 0;
       w.hubBurnedTotal = serverBurned(w);
       patch.positions = [];
+    } else if (c.demoHives && !demoOn(prev)) {
+      patch.positions = addDemo(w, Date.now());
+      if (!get().started) patch.positions = []; // start() seeds them with the world it creates
     }
     alignHarvest(w, c);
     // One update: a subscriber waiting for the config (HivePage's lookup) must not see the demo hives.
@@ -233,16 +273,7 @@ export const useHive = create<HiveStore>((set, get) => ({
     clock = createClock();
     countedSwarms.out.clear(); // the re-seeded world holds no remote hives yet
     countedSwarms.in.clear();
-    // mock positions for /me: the 2nd, 7th biggest and one abandoned hive
-    const order = world.order;
-    const positions: Position[] = demo
-      ? [
-          { ca: order[1], tokens: 12_400_000, share: 0.0124 },
-          { ca: order[6], tokens: 31_000_000, share: 0.031 },
-          { ca: order[58], tokens: 54_000_000, share: 0.054 },
-          { ca: order[59], tokens: 8_000_000, share: 0.008 },
-        ]
-      : [];
+    const positions: Position[] = demo ? demoPositions(world.order) : [];
     set({ world, stats: statsOf(world, config), started: true, positions, version: 1 });
     timer = setInterval(() => {
       const s = get();

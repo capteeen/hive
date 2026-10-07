@@ -1,4 +1,5 @@
 import LeaderboardTable from '@/components/LeaderboardTable';
+import HivesOrEmpty from '@/components/home/HivesOrEmpty';
 import { theme } from '@/themes';
 
 export const metadata = { title: `${theme.name} — leaderboard` };
@@ -12,7 +13,9 @@ export default function Page() {
         {theme.copy.resource} is the score. The biggest {theme.unit} by {theme.copy.resource} receives the {theme.copy.reward} every {theme.hubRitual}.
       </p>
       <div className="mt-8">
-        <LeaderboardTable />
+        <HivesOrEmpty body={`Nothing yet. The first ${theme.unit} founded tops this board until another one stores more ${theme.copy.resource}.`}>
+          <LeaderboardTable />
+        </HivesOrEmpty>
       </div>
     </div>
   );

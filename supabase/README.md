@@ -7,9 +7,11 @@ server instance, plus atomic cell claims and locks.
 
 ## Setup
 
+Step by step for a non-expert, including Vercel and the engine schedule: [`../GO-LIVE.md`](../GO-LIVE.md).
+
 1. Create a Supabase project.
-2. Apply the schema: paste `migrations/0001_hive.sql` into the SQL editor and run it, or use the CLI
-   (`supabase link` then `supabase db push`).
+2. Apply the schema: paste `migrations/0001_hive.sql` into the SQL editor and run it, then
+   `migrations/0002_live.sql`; or use the CLI (`supabase link` then `supabase db push`).
 3. Set the environment (server):
 
    | variable | where it is used |
@@ -20,8 +22,8 @@ server instance, plus atomic cell claims and locks.
 
    With the URL and service key set, the server uses Postgres (`lib/server/db-supabase.ts`). With the
    anon key set too, `/api/config` tells browsers to use Supabase Realtime and `/api/stream` returns
-   204. Without the anon key, browsers fall back to SSE, which carries no events in Supabase mode
-   (they still re-fetch every 60 s), so set all three.
+   204. Without the anon key, browsers fall back to SSE, which `/api/stream` then serves by
+   polling the database every few seconds; set all three for instant updates.
 
 ## What the migration creates
 
@@ -50,6 +52,29 @@ server instance, plus atomic cell claims and locks.
 * `hives`, `actions` and `harvests` are added to the `supabase_realtime` publication. The block is
   skipped if the publication does not exist or is `FOR ALL TABLES`. Browsers subscribe to `INSERT`
   and `UPDATE` on `hives`, and to `INSERT` on `actions` and `harvests`.
+
+### Migration 0002 (live-mode helpers)
+
+* A live hive may stand on a cell a preview (mock) hive occupies: `hives_cell_unique` becomes one unique
+  index per status (`hives_live_cell_unique`, `hives_mock_cell_unique`). The public reads of a live
+  server never show preview hives, and two hives of the same status still never share a cell.
+* `claim_live_cell(q, r, launch, expires)`: `claim_cell` for live launches. Preview hives do not block a
+  cell and a claim held by a `mode = 'mock'` launch gives way. Without 0002 the server falls back to
+  `claim_cell` (preview data then blocks its cells; the launch gets the nearest free one).
+* `hive_schema_info()`: a JSON report for `/api/health` and `npm run check:live`: schema version (2),
+  which tables and functions exist, RLS, `supabase_realtime` membership, and counts of preview / dry-run
+  rows and live rows. No row data.
+* Both functions are `SECURITY DEFINER` with a pinned `search_path`, executable by `service_role` only.
+
+### Deleting preview data: `cleanup-fake-data.sql`
+
+Paste into the SQL editor and run. In one transaction it deletes hives with status `mock` and their
+actions, prices, cell claims and meta (`image:<ca>`, `engine:hive:<ca>`, `engine:devOwed:<ca>`); launches
+with mode `mock` and their claims, payment claims (`payment:<sig>`), dev-buy bookkeeping and locks; the
+mock engine's run marks (`engine:mock:*`); every dry-run action and harvest, and harvests paid to a
+preview hive. It never deletes a `live` launch or anything of a live hive, and it keeps every encrypted
+key in `secrets` (a preview queen is a real keypair). It ends with a table of what is left and can be run
+again at any time.
 
 ### Re-running
 
@@ -81,9 +106,12 @@ The script needs Postgres 16 binaries (`/usr/lib/postgresql/16/bin`, or set `PGB
    (set `PG_OS_USER` to change this).
 2. Emulates Supabase with `tests/00_supabase_emulation.sql`: the `anon`, `authenticated` and
    `service_role` roles, Supabase's default grants, and the `supabase_realtime` publication.
-3. Applies the migration **twice**.
+3. Applies every migration in order, **twice**.
 4. Runs `tests/*.sql`, which cover the schema shape, what anon and authenticated can and cannot do,
-   constraints, and the semantics of `claim_cell` and `try_lock`.
-5. Races `claim_cell` and `try_lock` from 12 parallel connections and expects exactly one winner.
+   constraints, the semantics of `claim_cell`, `claim_live_cell`, `try_lock` and `hive_schema_info`, and
+   `cleanup-fake-data.sql` (run twice over seeded live and preview data: live rows survive, preview and
+   dry-run rows go, the second run changes nothing).
+5. Races `claim_cell`, `claim_live_cell` (on a preview launch's cell) and `try_lock` from 12 parallel
+   connections and expects exactly one winner each.
 
 `KEEP=1` keeps the cluster directory for inspection. The cluster is always stopped.

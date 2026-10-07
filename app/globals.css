@@ -4,11 +4,17 @@
 
 :root {
   color-scheme: dark;
+  /* keyboard focus: honey gold at night; the (darker) accent by day keeps 3:1 on the cream page */
+  --c-focus: var(--c-soft);
+  scrollbar-color: rgb(var(--c-accent) / 0.55) transparent;
+  scrollbar-width: thin;
 }
 html[data-mode='day'] {
   color-scheme: light;
+  --c-focus: var(--c-accent);
 }
 
+/* the page colour lives on <html>; <body> stays transparent so the honey backdrop (z-index -1) shows */
 html,
 body {
   background: rgb(var(--c-base));
@@ -18,6 +24,9 @@ body {
   font-variant-numeric: tabular-nums;
   -webkit-font-smoothing: antialiased;
   transition: background-color 900ms cubic-bezier(0.22, 1, 0.36, 1), color 900ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+body {
+  background: transparent;
 }
 
 * {
@@ -35,7 +44,32 @@ h4,
 }
 
 ::selection {
-  background: rgb(var(--c-accent) / 0.35);
+  background: rgb(var(--c-soft) / 0.9);
+  color: #120c06;
+}
+
+/* thin amber scrollbars (WebKit; others use scrollbar-color on :root) */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 999px;
+  background: rgb(var(--c-accent) / 0.5) padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--c-accent) / 0.8) padding-box;
+}
+
+/* honey focus ring (shapes cut by clip-path draw theirs inside: see the end of this file) */
+:where(a, button, input, select, textarea, summary, [tabindex]):focus-visible:not(.shape-btn, .shape-hex, .shape-card, .shape-avatar, [data-cut], .inp) {
+  outline: 2px solid rgb(var(--c-focus));
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
 /* ---------- shape language ---------- */
@@ -98,15 +132,30 @@ html[data-mode='day'] .glass {
 .glow {
   box-shadow: inset 0 0 18px rgb(var(--c-accent) / 0.35), 0 0 32px -8px rgb(var(--c-accent) / 0.55);
 }
+/* glossy honey: a specular highlight across the top, a deeper amber pooling at the bottom,
+   and a slightly viscous (overshooting) hover */
 .btn-honey {
-  background: linear-gradient(180deg, rgb(var(--c-soft)) 0%, rgb(var(--c-accent)) 100%);
-  color: rgb(var(--c-base));
-  box-shadow: inset 0 1px 0 rgb(255 255 255 / 0.45), inset 0 -6px 14px rgb(var(--c-base) / 0.18), 0 10px 28px -10px rgb(var(--c-accent) / 0.7);
-  transition: transform 600ms, filter 600ms, box-shadow 600ms;
+  background:
+    radial-gradient(70% 55% at 50% 0%, rgb(255 255 255 / 0.55), rgb(255 255 255 / 0) 70%),
+    radial-gradient(90% 70% at 50% 120%, rgb(var(--c-accent)) 0%, rgb(var(--c-accent) / 0) 70%),
+    linear-gradient(180deg, rgb(var(--c-soft)) 0%, rgb(var(--c-accent)) 78%, rgb(var(--c-accent)) 100%);
+  color: #1c1409;
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.6),
+    inset 0 -3px 6px rgb(120 60 0 / 0.28),
+    0 10px 28px -10px rgb(var(--c-accent) / 0.75);
+  transition:
+    transform 520ms cubic-bezier(0.34, 1.56, 0.64, 1),
+    filter 600ms,
+    box-shadow 600ms;
 }
 .btn-honey:hover {
-  filter: brightness(1.06);
-  transform: translateY(-1px);
+  filter: brightness(1.07) saturate(1.05);
+  transform: translateY(-1px) scale(1.025, 1.04);
+}
+.btn-honey:active {
+  transform: translateY(0) scale(0.985);
+  transition-duration: 140ms;
 }
 .btn-ghost {
   background: rgb(var(--c-surface) / 0.7);
@@ -189,7 +238,8 @@ html[data-shape='circle'] .hexbar > i {
   height: 6px;
 }
 .scroll-thin::-webkit-scrollbar-thumb {
-  background: rgb(var(--c-accent) / 0.3);
+  border: 0;
+  background: rgb(var(--c-accent) / 0.35);
   border-radius: 3px;
 }
 
@@ -321,11 +371,12 @@ html[data-mode='day'] .wiz-range {
 }
 
 /* ---------- ambient life (components/fx) ---------- */
-/* One fixed overlay above the page (nav is z-40, modals z-50). Only coins and the bee catch clicks. */
+/* One fixed overlay above the page and the nav (z-40; a bee may land on the logo), below modals
+   (z-50). Only the coins and the bees catch clicks. */
 .fx-layer {
   position: fixed;
   inset: 0;
-  z-index: 35;
+  z-index: 45;
   pointer-events: none;
   overflow: hidden;
   contain: strict;
@@ -475,54 +526,201 @@ html[data-mode='day'] .mc-label {
   }
 }
 
-/* flying bee: the button moves (translate only, so its shadow stays below), the svg turns */
-.fx-layer .bee-fly {
+/* ambient bees (components/fx/Swarm): the button only translates (so its shadow stays on the
+   page), the body bobs, tilts, banks and turns round; far bees are smaller, fainter and soft */
+.fx-layer .fxb {
   position: absolute;
   left: 0;
   top: 0;
-  width: 56px;
-  height: 44px;
-  margin: -22px 0 0 -28px;
+  width: 44px;
+  height: 36px;
+  margin: -18px 0 0 -22px;
   pointer-events: auto;
   cursor: pointer;
   will-change: transform;
+  animation: fxbIn 700ms ease-out both;
 }
-.bee-fly svg {
+.fx-layer .fxb.off {
+  display: none;
+}
+.fxb-body {
+  position: absolute;
+  inset: 0;
+  display: block;
+  will-change: transform;
+}
+.fxb-body svg {
   display: block;
   width: 100%;
   height: 100%;
   overflow: visible;
-  will-change: transform;
 }
-.bee-shadow {
+.fxb.far .fxb-body {
+  opacity: 0.62;
+  filter: blur(0.8px);
+}
+.fxb.near .fxb-body {
+  filter: blur(0.5px);
+}
+.fxb-shadow {
   position: absolute;
   left: 50%;
-  top: 100%;
-  width: 24px;
-  height: 6px;
-  margin: 2px 0 0 -12px;
+  top: 50%;
+  width: 26px;
+  height: 7px;
+  margin: -3.5px 0 0 -13px;
   border-radius: 50%;
-  background: radial-gradient(closest-side, rgb(0 0 0 / 0.3), transparent);
+  background: radial-gradient(closest-side, rgb(40 20 0 / 0.3), transparent);
+  will-change: transform;
 }
-.bee-wing {
+.fxb.far .fxb-shadow {
+  opacity: 0.45;
+}
+.fxb.rest .fxb-shadow {
+  background: radial-gradient(closest-side, rgb(30 15 0 / 0.5), transparent);
+}
+/* wings hinge at their bottom-right corner (where they meet the thorax) */
+.fxb-wings {
   transform-box: fill-box;
-  transform-origin: 50% 100%;
-  animation: beeFlap 64ms linear infinite alternate;
+  transform-origin: 100% 100%;
+  animation: fxbFlap 44ms linear infinite alternate;
 }
-.bee-wing.b {
-  animation-delay: -32ms;
+.fxb-wings.back {
+  animation-delay: -22ms;
 }
-.bee-fly.fast .bee-wing {
-  animation-duration: 36ms;
+.fxb.fast .fxb-wings {
+  animation-duration: 30ms;
 }
-@keyframes beeFlap {
+/* perched: wings folded back, a slow flick now and then */
+.fxb.rest .fxb-wings {
+  animation: fxbFlick 2.6s ease-in-out infinite;
+}
+.fxb.rest .fxb-wings.back {
+  animation-delay: -0.2s;
+}
+.fxb-fan {
+  transition: opacity 300ms;
+}
+.fxb.rest .fxb-fan {
+  opacity: 0;
+}
+@keyframes fxbIn {
   from {
-    transform: rotate(-8deg) scaleY(1);
+    opacity: 0;
   }
   to {
-    transform: rotate(10deg) scaleY(0.32);
+    opacity: 1;
   }
 }
+@keyframes fxbFlap {
+  from {
+    transform: rotate(26deg) scaleY(1);
+  }
+  to {
+    transform: rotate(-16deg) scaleY(0.36);
+  }
+}
+@keyframes fxbFlick {
+  0%,
+  60%,
+  100% {
+    transform: rotate(-18deg) scaleY(0.82);
+  }
+  66% {
+    transform: rotate(22deg) scaleY(1);
+  }
+  72% {
+    transform: rotate(-12deg) scaleY(0.88);
+  }
+  78% {
+    transform: rotate(16deg) scaleY(1);
+  }
+  86% {
+    transform: rotate(-18deg) scaleY(0.82);
+  }
+}
+
+/* honey on click (components/fx/HoneyTap): a tiny droplet, a thin ring and three falling drops */
+.fx-taps {
+  position: absolute;
+  inset: 0;
+}
+.fx-tap {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 7px;
+  height: 7px;
+  margin: -3.5px 0 0 -3.5px;
+  border-radius: 50% 50% 50% 50% / 58% 58% 42% 42%;
+  background: radial-gradient(circle at 38% 32%, #fff6da 0 16%, #ffc866 42%, #e08e12 88%);
+  box-shadow: 0 1px 4px rgb(224 142 18 / 0.5);
+  animation: fxTap 560ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+.fx-tap::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1.5px solid rgb(255 200 102 / 0.85);
+  animation: fxTapRing 420ms ease-out forwards;
+}
+.fx-tap::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 3px;
+  height: 3.6px;
+  margin: -1.8px 0 0 -1.5px;
+  border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+  background: #f5a524;
+  box-shadow:
+    -7px -2px 0 0 #ffc866,
+    7px -3px 0 0 #f5a524,
+    1px -8px 0 -0.5px #ffc866;
+  animation: fxTapDrops 560ms cubic-bezier(0.3, 0, 0.9, 0.6) forwards;
+}
+@keyframes fxTap {
+  0% {
+    scale: 0.3;
+    opacity: 1;
+  }
+  30% {
+    scale: 1.25;
+    opacity: 1;
+  }
+  100% {
+    scale: 0.7;
+    opacity: 0;
+    translate: 0 10px;
+  }
+}
+@keyframes fxTapRing {
+  0% {
+    transform: scale(0.4);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(3);
+    opacity: 0;
+  }
+}
+@keyframes fxTapDrops {
+  0% {
+    transform: translateY(0) scale(0.6);
+    opacity: 0;
+  }
+  15% {
+    transform: translateY(-2px) scale(1);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(20px) scale(0.9);
+    opacity: 0;
+  }
+}
+
 /* the honey splash a caught bee leaves behind: a ring (::before) and falling drops (::after) */
 .bee-splash {
   position: absolute;
@@ -618,5 +816,181 @@ html[data-shape='circle'] [data-cut] {
 .shape-avatar:focus-visible,
 [data-cut]:focus-visible {
   outline: none;
-  box-shadow: inset 0 0 0 2px rgb(var(--c-accent)), inset 0 0 0 4px rgb(var(--c-base) / 0.7);
+  box-shadow: inset 0 0 0 2px rgb(var(--c-focus)), inset 0 0 0 4px rgb(var(--c-base) / 0.7);
+}
+
+/* ---------- honey (components/fx/Honey; themes with ambience.honey set html[data-honey='on']) ---------- */
+/* behind every page: warm glow pools and a faint honeycomb that fades out away from them */
+.honey-bg {
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background:
+    radial-gradient(44vmax 32vmax at 6% 14%, rgb(var(--c-accent) / 0.11), transparent 70%),
+    radial-gradient(38vmax 30vmax at 96% 48%, rgb(var(--c-soft) / 0.075), transparent 70%),
+    radial-gradient(56vmax 30vmax at 38% 108%, rgb(var(--c-accent) / 0.09), transparent 70%);
+}
+.honey-bg::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: rgb(var(--c-accent) / 0.16);
+  -webkit-mask:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='60' height='34.64' viewBox='0 0 60 34.64'%3E%3Cpath d='M0 17.32 10 0h20l10 17.32-10 17.32H10zM40 17.32h20' fill='none' stroke='%23000' stroke-width='1.1'/%3E%3C/svg%3E") 0 0 / 60px 34.64px repeat,
+    radial-gradient(70vmax 55vmax at 4% 10%, #000 0%, rgb(0 0 0 / 0.35) 45%, rgb(0 0 0 / 0.12) 100%);
+  -webkit-mask-composite: source-in;
+  mask:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='60' height='34.64' viewBox='0 0 60 34.64'%3E%3Cpath d='M0 17.32 10 0h20l10 17.32-10 17.32H10zM40 17.32h20' fill='none' stroke='%23000' stroke-width='1.1'/%3E%3C/svg%3E") 0 0 / 60px 34.64px repeat,
+    radial-gradient(70vmax 55vmax at 4% 10%, #000 0%, rgb(0 0 0 / 0.35) 45%, rgb(0 0 0 / 0.12) 100%);
+  mask-composite: intersect;
+}
+html[data-mode='day'] .honey-bg::before {
+  background: rgb(var(--c-accent) / 0.13);
+}
+
+/* the nav's honey: a glossy film along its bottom edge with drips hanging from it */
+.honey-drips {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  height: 0;
+  pointer-events: none;
+}
+.honey-film,
+.honey-pool-film {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -1px;
+  height: 10px;
+  background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='10' viewBox='0 0 120 10'%3E%3Cdefs%3E%3ClinearGradient id='g' x1='0' y1='0' x2='0' y2='1'%3E%3Cstop offset='0' stop-color='%23FFD98A'/%3E%3Cstop offset='.55' stop-color='%23F5A524'/%3E%3Cstop offset='1' stop-color='%23A85F08'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M0 0h120v3c-10 0-15 4-25 4S80 3.6 70 3.6C58 3.6 52 8 40 8S22 3 12 3C6 3 3 3 0 3z' fill='url(%23g)'/%3E%3Cpath d='M0 1.3h120' stroke='%23FFF6DA' stroke-opacity='.55' stroke-width='.7'/%3E%3C/svg%3E")
+    0 0 / 120px 10px repeat-x;
+  filter: drop-shadow(0 2px 3px rgb(245 165 36 / 0.35));
+}
+.honey-drip {
+  position: absolute;
+  top: 3px;
+  margin-left: -9px;
+  transform-origin: 50% 0;
+  animation: honeyStretch 10s ease-in-out infinite;
+  will-change: transform;
+}
+.honey-drip svg {
+  display: block;
+  filter: drop-shadow(0 2px 2px rgb(110 55 0 / 0.35));
+}
+/* a droplet lets go at the stretch's peak (80%) and falls, while the drip snaps back */
+.honey-drop {
+  position: absolute;
+  width: 6px;
+  height: 7px;
+  margin-left: -3px;
+  border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+  background: radial-gradient(circle at 38% 30%, #fff6da 0 18%, #ffc866 42%, #e08e12 88%);
+  box-shadow: 0 1px 3px rgb(110 55 0 / 0.35);
+  opacity: 0;
+  animation: honeyFall 10s linear infinite;
+  will-change: transform, opacity;
+}
+@keyframes honeyStretch {
+  0% {
+    transform: scaleY(0.84);
+  }
+  80% {
+    transform: scaleY(1.16);
+  }
+  84% {
+    transform: scaleY(0.8);
+  }
+  90% {
+    transform: scaleY(0.9);
+  }
+  100% {
+    transform: scaleY(0.84);
+  }
+}
+@keyframes honeyFall {
+  0%,
+  79.5% {
+    opacity: 0;
+    transform: translateY(0) scale(0.6, 0.9);
+  }
+  80% {
+    opacity: 1;
+    transform: translateY(0) scale(0.9, 1.15);
+    animation-timing-function: cubic-bezier(0.55, 0, 1, 0.5);
+  }
+  95% {
+    opacity: 0.9;
+    transform: translateY(150px) scale(0.8, 1.25);
+  }
+  100% {
+    opacity: 0;
+    transform: translateY(185px) scale(0.8, 1.25);
+  }
+}
+@media (max-width: 639px) {
+  .honey-drips .wide {
+    display: none;
+  }
+  /* shorter drips on phones, where the page's first line sits close under the nav */
+  .honey-drips {
+    transform: scaleY(0.75);
+    transform-origin: 50% 0;
+  }
+}
+
+/* honey pooled on the footer's top edge, fading out toward the sides */
+.honey-pool {
+  position: absolute;
+  inset: 0 0 auto;
+  height: 0;
+  z-index: 1;
+  pointer-events: none;
+  -webkit-mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+  mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+}
+.honey-pool .honey-drip {
+  animation-name: honeyStretchSoft;
+}
+@keyframes honeyStretchSoft {
+  0%,
+  100% {
+    transform: scaleY(0.9);
+  }
+  50% {
+    transform: scaleY(1.1);
+  }
+}
+
+/* drips on the cards' top edges (static): film plus two drips near the right corner */
+html[data-honey='on'] .shape-card.glass {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='76' height='22' viewBox='0 0 76 22'%3E%3Cdefs%3E%3ClinearGradient id='h' x1='0' y1='0' x2='1' y2='0'%3E%3Cstop offset='0' stop-color='%23F5A524' stop-opacity='0'/%3E%3Cstop offset='.2' stop-color='%23FFC866' stop-opacity='.85'/%3E%3Cstop offset='.55' stop-color='%23F5A524'/%3E%3Cstop offset='.85' stop-color='%23FFC866' stop-opacity='.85'/%3E%3Cstop offset='1' stop-color='%23F5A524' stop-opacity='0'/%3E%3C/linearGradient%3E%3C/defs%3E%3Cpath d='M0 0h76v2.2c-8 0-12 0-12.6 1.6V12c0 1.6 1.8 2.4 1.8 5a3 3 0 1 1-6 0c0-2.6 1.8-3.4 1.8-5V3.8C60.4 2.4 40 2.2 30 2.2c-6 0-7 .6-7 2.4V8a2.5 2.5 0 1 1-5 0V4.6c0-1.8-2-2.4-8-2.4H0z' fill='url(%23h)'/%3E%3Ccircle cx='60.8' cy='16.6' r='.9' fill='%23FFFBEF' opacity='.8'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 18% top 0;
+  background-size: 76px 22px;
+}
+html[data-honey='on'] [role='dialog'] .shape-card.glass {
+  background-image: none;
+}
+
+/* motion off: reduced motion, or the nav's Bees switch */
+@media (prefers-reduced-motion: reduce) {
+  .honey-drip,
+  .honey-drop {
+    animation: none;
+  }
+}
+html[data-ambience='off'] .honey-drip,
+html[data-ambience='off'] .honey-drop {
+  animation: none;
+}
+
+/* the nav logo as a glossy honey hexagon (hive theme) */
+.logo-honey {
+  background:
+    radial-gradient(60% 45% at 38% 22%, rgb(255 246 218 / 0.85), rgb(255 246 218 / 0) 70%),
+    linear-gradient(160deg, #ffc866 0%, #f5a524 55%, #b4690a 100%);
 }

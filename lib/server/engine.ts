@@ -107,7 +107,13 @@ export const ENGINE_META = {
   hive: (ca: string) => `engine:hive:${ca}`,
   /** Dev-buy tokens a launch still owes its owner (DevTokensOwed): it went live without sending them. */
   devOwed: (ca: string) => `engine:devOwed:${ca}`,
+  /** When a job last ran to the end ({ at, dryRun? }), for /api/health. */
+  lastRun: (mode: LaunchMode, job: 'hourly' | 'harvest' | 'refresh') => `engine:${mode}:lastRun:${job}`,
 } as const;
+
+/** Record that `job` ran (best effort: a failed write never fails the run). */
+const noteRun = (d: Deps, job: 'hourly' | 'harvest' | 'refresh', dryRun?: boolean) =>
+  d.db.setMeta(ENGINE_META.lastRun(d.mode, job), JSON.stringify(dryRun === undefined ? { at: d.clock() } : { at: d.clock(), dryRun })).catch(() => {});
 
 /** Length of an engine hour: a real hour live, the simulator's mock hour (60 s) in mock mode. */
 export const engineHourMs = (mode: LaunchMode) => (mode === 'live' ? LIVE_HOUR_MS : HOUR_MS);
@@ -1103,6 +1109,7 @@ export async function runHourly(ctx: EngineCtx = {}): Promise<HourlySummary> {
     await d.db.setMeta(ENGINE_META.hubPlanned(d.mode, d.dryRun), JSON.stringify({ hour: d.hour, hourMs: d.hourMs, shareSol: summary.hubPlannedSol, sentSol: summary.hubSentSol }));
     if (summary.hives.some((h) => h.deferred)) summary.incomplete = true;
     else await d.db.setMeta(markKey, markOf(d));
+    await noteRun(d, 'hourly', d.dryRun);
     return done();
   } finally {
     await d.db.setMeta(busyKey, '').catch(() => {});
@@ -1554,6 +1561,7 @@ export async function runHarvest(ctx: EngineCtx = {}): Promise<HarvestSummary> {
     } else {
       await liveHarvest(d, { keypair: hub.keypair!, wallet: hub.wallet!, mint: hub.mint! }, open, out);
     }
+    await noteRun(d, 'harvest', !canSendHub);
     return done();
   } catch (e) {
     const msg = safeErr(e);
@@ -1803,6 +1811,7 @@ export async function runRefresh(ctx: EngineCtx = {}): Promise<RefreshSummary> {
       else if ('outcome' in r && r.outcome === 'changed') out.updated++;
       else if ('outcome' in r && r.outcome === 'deferred') out.deferred++;
     }
+    await noteRun(d, 'refresh');
     return { ...out, ms: Date.now() - t0 };
   } finally {
     await d.db.unlock('engine:refresh').catch(() => {});

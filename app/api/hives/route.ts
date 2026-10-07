@@ -1,11 +1,15 @@
 import { NextResponse } from 'next/server';
 import { getDb } from '@/lib/server/db';
+import { config } from '@/lib/server/config';
+import { publicView } from '@/lib/shared/visibility';
 import { UNKNOWN_IP, clientIp, rateLimit } from '@/lib/server/ratelimit';
 import type { HivesResponse } from '@/lib/shared/api';
 import { publicHive } from '@/app/api/_lib/public';
 
 /**
  * GET /api/hives: every stored hive, the newest 200 actions and the newest 60 harvests.
+ * Live launch mode: only real chain data (lib/shared/visibility.ts): live hives, and actions and
+ * harvests that were really sent, for live hives. Preview rows and dry runs stay out.
  * Images are not inlined (each hive's `image` is a URL; data-URL images are served by
  * /api/hives/[ca]/image), so the body stays small however many hives there are.
  * Shared caches may keep it for 5 s (every tab re-fetches it once a minute); clients that can be told
@@ -34,7 +38,10 @@ export async function GET(req: Request) {
   }
   try {
     const db = await getDb();
-    const [hives, actions, harvests] = await Promise.all([db.listHives(), db.listActions(200), db.listHarvests(60)]);
+    const mode = config.launchMode;
+    const real = mode === 'live';
+    const lists = await Promise.all([db.listHives(), db.listActions(200, undefined, { real }), db.listHarvests(60, { real })]);
+    const { hives, actions, harvests } = publicView(mode, { hives: lists[0], actions: lists[1], harvests: lists[2] });
     const kept = capHives(hives);
     const body: HivesResponse = { hives: kept.map(publicHive), actions, harvests, serverTime: Date.now() };
     if (kept.length < hives.length) body.omitted = hives.length - kept.length;

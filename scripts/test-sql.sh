@@ -6,9 +6,10 @@
 #
 # Steps: initdb a fresh cluster under $HIVE_PG_TEST_DIR (default /tmp/hive-pg-test) listening on a
 # free port (127.0.0.1 + a private unix socket dir), emulate Supabase (roles anon / authenticated /
-# service_role, its default grants, publication supabase_realtime), apply the migration TWICE (re-run
-# safety), run supabase/tests/[0-9][0-9]_*.sql (assertions raise on failure), then race claim_cell and
-# try_lock from parallel connections.
+# service_role, its default grants, publication supabase_realtime), apply every migration TWICE in order
+# (re-run safety), run supabase/tests/[0-9][0-9]_*.sql (assertions raise on failure; 40_cleanup.sql runs
+# supabase/cleanup-fake-data.sql twice), then race claim_cell, claim_live_cell and try_lock from
+# parallel connections.
 #
 # Postgres refuses to run as root: when invoked as root the cluster is owned by the OS user
 # $PG_OS_USER (default: postgres) via runuser/su, while psql connects from the current user over the
@@ -130,5 +131,8 @@ race() {
 echo "== races"
 race "claim_cell on one cell" "select public.claim_cell(40, 40, 'race-%s', now() + interval '10 minutes')"
 race "try_lock on one name" "select public.try_lock('race', now() + interval '1 minute') -- caller %s"
+# a cell held by a preview launch: every live launch may take it over, but only one gets it
+psql_db -c "insert into public.launches (id, mode, state, owner, payload, queen_wallet, mint_pubkey, mint_secret_enc, cell_q, cell_r, lamports, expires_at) values ('race-mock', 'mock', 'reserved', 'o', '{}', 'race-q', 'race-m', 'v1.x.x.x', 41, 41, 0, now() + interval '10 minutes'); select public.claim_cell(41, 41, 'race-mock', now() + interval '10 minutes')" >/dev/null
+race "claim_live_cell on a preview launch's cell" "select public.claim_live_cell(41, 41, 'race-live-%s', now() + interval '10 minutes')"
 
 echo "ALL SQL TESTS PASSED ($PASSED assertions)"

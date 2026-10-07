@@ -94,8 +94,10 @@ export function createWorld(seed = SEED, now = Date.now(), demo = true): World {
     harvests: [],
     hubPool: 0,
     hubBurnedTotal: 0,
-    hubPrice: 0.000012,
-    nextHarvestAt: Math.ceil(now / HOUR_MS) * HOUR_MS,
+    // a made-up $HIVE price only for the demo: the server publishes none
+    hubPrice: demo ? 0.000012 : 0,
+    // nothing is simulated without the demo: no simulated harvest either (the server's comes from its feed)
+    nextHarvestAt: demo ? Math.ceil(now / HOUR_MS) * HOUR_MS : Infinity,
     events: [],
     eventSeq: 0,
     seq: 0,
@@ -376,7 +378,7 @@ export function earnFees(world: World, h: Hive, amount: number, now: number, rng
 function runHarvest(world: World, now: number, rng: Rng) {
   const feesIn = world.hubPool;
   world.hubPool = 0;
-  const bought = feesIn / world.hubPrice;
+  const bought = world.hubPrice > 0 ? feesIn / world.hubPrice : 0;
   const burned = bought * theme.hubSplit.burn;
   const jelly = bought * theme.hubSplit.toBiggest;
   world.hubPrice *= 1 + Math.min(0.05, feesIn * 0.01);
@@ -490,9 +492,11 @@ export function occupiedKeys(world: World) {
 
 /**
  * The empty cells a new unit can be founded in: every free cell that touches an occupied one.
- * The comb only grows outward from its edge, so this is the clickable "empty box" ring.
+ * The comb only grows outward from its edge, so this is the clickable "empty box" ring. An empty comb
+ * (no demo hives, nothing launched yet) offers the origin: the first hive's cell.
  */
 export function frontierCells(world: World): Cell[] {
+  if (world.order.length === 0) return [{ q: 0, r: 0 }];
   const taken = occupiedKeys(world);
   const out = new Map<string, Cell>();
   for (const ca of world.order) {

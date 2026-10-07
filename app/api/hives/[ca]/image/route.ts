@@ -1,4 +1,6 @@
 import { getDb } from '@/lib/server/db';
+import { config } from '@/lib/server/config';
+import { hiveIsPublic } from '@/lib/shared/visibility';
 import { UNKNOWN_IP, clientIp, rateLimit } from '@/lib/server/ratelimit';
 import { hiveImageMetaKey, imageVersion, isDataUrl } from '@/lib/shared/rows';
 
@@ -8,6 +10,7 @@ import { hiveImageMetaKey, imageVersion, isDataUrl } from '@/lib/shared/rows';
  *   - `?v=` matching the current image: cached for a year (immutable); a new image gets a new `v`.
  *   - anything else: cached briefly. ETag / If-None-Match -> 304.
  *   - a hive whose image is an https URL (live coins on IPFS): redirect there.
+ *   - live launch mode: a preview hive's image is not found (like the hive itself).
  */
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -30,10 +33,13 @@ export async function GET(req: Request, { params }: { params: { ca: string } }) 
   }
   try {
     const db = await getDb();
+    // Live mode reads the hive first: whether it may be shown depends on its status.
+    let hive = config.launchMode === 'live' ? await db.getHive(ca) : undefined;
+    if (hive === null || (hive && !hiveIsPublic(config.launchMode, hive))) return notFound();
     let src = await db.getMeta(hiveImageMetaKey(ca));
     if (!src) {
       // a hive written before images moved out of the hive record still carries its data URL
-      const hive = await db.getHive(ca);
+      hive ??= await db.getHive(ca);
       if (!hive) return notFound();
       if (/^https:\/\//i.test(hive.image)) return new Response(null, { status: 302, headers: { Location: hive.image, 'Cache-Control': SHORT } });
       if (!isDataUrl(hive.image)) return notFound();

@@ -1,6 +1,6 @@
 'use client';
 /**
- * Money splashes: every 7–16 s a burst of SOL coins and honey drops pops somewhere on screen,
+ * Money splashes: every 12–24 s a burst of SOL coins and honey drops pops somewhere on screen,
  * flies outward under gravity, spins and fades over ~1.6 s, with a label rising from the middle.
  * Half the time the label is the latest real action in the store ("+0.12 SOL · $AMBER"),
  * otherwise a random "+0.xx SOL". Coins can be caught: a click pops one with a sparkle and a clink.
@@ -20,8 +20,9 @@ const LIFE_S = 1.6; // particle lifetime
 const LABEL_S = 1.95; // label animation (matches mcLabel in globals.css) + a little slack
 const GRAVITY = 900; // px/s²
 const DRAG = 1.4; // 1/s, horizontal air drag: keeps the burst about ±280 px wide
-const EVERY_MS: [number, number] = [7000, 16000];
-const FIRST_MS: [number, number] = [3500, 8000];
+// rarer than they used to be: the swarm and the honey drips keep the page alive in between
+export const EVERY_MS: [number, number] = [12000, 24000];
+export const FIRST_MS: [number, number] = [6000, 11000];
 
 interface Particle {
   kind: 'coin' | 'drop';
@@ -118,7 +119,7 @@ export default function MoneySplash() {
   const burstRef = useRef<Burst | null>(null);
   burstRef.current = burst;
 
-  // schedule: one burst at a time, the next one 7–16 s after the previous started
+  // schedule: one burst at a time, the next one 12–24 s after the previous started
   useEffect(() => {
     let timer: ReturnType<typeof setTimeout>;
     const next = (range: [number, number]) => {

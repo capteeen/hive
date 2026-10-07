@@ -20,10 +20,11 @@ export type SfxName =
   | 'swatch'
   | 'launch'
   | 'error'
-  // ambient life (components/fx): a caught SOL coin, a caught bee, and the bee's buzz
+  // ambient life (components/fx): a caught SOL coin, a caught bee, the bee's buzz, a near bee passing
   | 'coin'
   | 'catch'
-  | 'buzz';
+  | 'buzz'
+  | 'flyby';
 
 let ctx: AudioContext | null = null;
 let master: GainNode | null = null;
@@ -203,6 +204,8 @@ const SOUNDS: Record<SfxName, (ac: AudioContext) => void> = {
   },
   // a short bee buzz flying off
   buzz: (ac) => buzz(ac, 0, 0.38, 0.05, 220),
+  // a near bee passing: a quiet buzz that swells and falls in pitch as it goes by (Doppler)
+  flyby: (ac) => buzz(ac, 0, 1.1, 0.022, 250),
 };
 
 /** Play a UI sound (no-op when muted, on the server, or before audio is available). */

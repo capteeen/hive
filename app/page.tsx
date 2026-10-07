@@ -5,6 +5,7 @@ import Log from '@/components/Log';
 import Section from '@/components/Section';
 import ExplorePreview from '@/components/home/ExplorePreview';
 import LeaderboardTable from '@/components/LeaderboardTable';
+import HivesOrEmpty from '@/components/home/HivesOrEmpty';
 import { theme } from '@/themes';
 
 const cap = (s: string) => s[0].toUpperCase() + s.slice(1);
@@ -28,7 +29,9 @@ export default function Home() {
             <ExplorePreview />
           </Section>
           <Section eyebrow="leaderboard" title={`Most ${theme.copy.resource}`} action={{ href: '/leaderboard', label: 'Full leaderboard' }} className="!px-0">
-            <LeaderboardTable tab="honey" limit={5} showTabs={false} />
+            <HivesOrEmpty body={`The leaderboard ranks real ${theme.unitPlural} by ${theme.copy.resource}. Nothing is ranked yet.`}>
+              <LeaderboardTable tab="honey" limit={5} showTabs={false} />
+            </HivesOrEmpty>
           </Section>
         </div>
       </div>

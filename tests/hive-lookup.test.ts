@@ -4,6 +4,11 @@ import { useHive } from '@/lib/store';
 import type { HiveDetailResponse } from '@/lib/shared/rows';
 import type { RemoteAction, RemoteHive } from '@/lib/shared/api';
 
+// These cases exercise the demo hives a NEXT_PUBLIC_DEMO_HIVES=1 build shows before /api/config loads.
+vi.hoisted(() => {
+  process.env.NEXT_PUBLIC_DEMO_HIVES = '1';
+});
+
 /**
  * HivePage used to call an address "not found" once a 4s timer passed and the realtime feed was
  * 'live'. The feed says nothing about whether GET /api/hives has arrived, so a real remote hive on a

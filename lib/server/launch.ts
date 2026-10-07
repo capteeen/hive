@@ -129,6 +129,9 @@ async function deps(ctx: LaunchCtx): Promise<Deps> {
 const errText = (e: unknown) => (e instanceof Error ? e.message : String(e)).replace(/\s+/g, ' ').slice(0, 240);
 const cap = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 
+/** Live launches never treat preview data (mock hives, mock launches' claims) as occupying a cell. */
+const cellScope = (mode: LaunchMode) => ({ liveOnly: mode === 'live' });
+
 /** SOL → lamports, rounded up, immune to float dust (0.07 * 1e9 = 70000000.00000001). */
 export function lamportsFor(sol: number) {
   return Math.ceil(Number((sol * 1e9).toFixed(3)));
@@ -236,7 +239,7 @@ export async function prepareLaunch(body: unknown, ctx: LaunchCtx = {}): Promise
 
   let claim: { cell: { q: number; r: number }; changed: boolean };
   try {
-    claim = await claimLaunchCell(d.db, payload.cell ?? null, id, expiresAt, now);
+    claim = await claimLaunchCell(d.db, payload.cell ?? null, id, expiresAt, now, cellScope(d.mode));
   } catch (e) {
     throw new LaunchError(errText(e), 503);
   }
@@ -430,7 +433,7 @@ async function stepPay(d: Deps, l: LaunchRecord, paySig?: string): Promise<Launc
   let cell = l.cell;
   if (now > l.expiresAt) {
     try {
-      const again = await claimLaunchCell(d.db, l.cell, l.id, now + LIMITS.reservationMs, now);
+      const again = await claimLaunchCell(d.db, l.cell, l.id, now + LIMITS.reservationMs, now, cellScope(l.mode));
       cell = again.cell;
     } catch (e) {
       return cas(d, l, { txs: { ...l.txs, payment: sig }, error: `Paid, but no free cell right now (${errText(e)}). Retry in a moment.` });
@@ -685,6 +688,9 @@ export async function refundLaunch(id: string, body: unknown, ctx: LaunchCtx = {
   let l = await d.db.getLaunch(id);
   if (!l) throw new LaunchError('Launch not found.', 404);
   if (l.state === 'refunded') return toStatus(d.db, l);
+  // A preview launch found in a live database has nothing on chain to refund (and a live one must never
+  // be "refunded" against the mock chain): only the server mode that made a launch may refund it.
+  if (l.mode !== d.mode) throw new LaunchError(`This launch was prepared in ${l.mode} mode, but the server now runs in ${d.mode} mode.`, 409);
   if (isDue(l, d.now())) l = await expire(d, l);
   if (l.state !== 'failed' && l.state !== 'expired') throw new LaunchError('Only a failed or expired launch can be refunded.', 409);
 
@@ -746,7 +752,7 @@ export async function refundLaunch(id: string, body: unknown, ctx: LaunchCtx = {
         }
         // A create that landed after we gave up means the coin exists: finish the launch instead of draining it.
         if (exists) {
-          const again = await claimLaunchCell(d.db, l.cell, l.id, d.now() + LIMITS.reservationMs, d.now()).catch(() => null);
+          const again = await claimLaunchCell(d.db, l.cell, l.id, d.now() + LIMITS.reservationMs, d.now(), cellScope(l.mode)).catch(() => null);
           if (again) await d.db.finalizeCell(l.id);
           await cas(d, l, { state: 'metadata', attempts: 0, cell: again?.cell ?? l.cell, error: 'Your coin was created after all. Press Retry to finish the launch.' }, ['failed']);
           throw new LaunchError('Your coin was created after all. Press Retry to finish the launch instead.', 409);

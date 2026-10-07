@@ -45,6 +45,14 @@ export interface ThemeCopy {
   footer: string;
 }
 
+/** Ambient decoration on every page (components/fx). Optional: a theme without it gets none. */
+export interface Ambience {
+  /** What flies around the page (a small swarm, landing on buttons now and then), or nothing. */
+  critter: 'bee' | null;
+  /** Honey everywhere: drips under the nav, a honeycomb texture and glow in the background, honey on click. */
+  honey: boolean;
+}
+
 export interface Theme {
   id: string;
   name: string;
@@ -77,4 +85,5 @@ export interface Theme {
   shape: 'hex' | 'circle';
   scene: 'comb' | 'den';
   copy: ThemeCopy;
+  ambience?: Ambience;
 }

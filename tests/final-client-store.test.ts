@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { PublicConfig, RemoteAction, RemoteHarvest, RemoteHive } from '@/lib/shared/api';
 
+// These cases exercise the demo hives a NEXT_PUBLIC_DEMO_HIVES=1 build shows before /api/config loads.
+vi.hoisted(() => {
+  process.env.NEXT_PUBLIC_DEMO_HIVES = '1';
+});
+
 /**
  * Client store regressions (final review, client group):
  *   #10 remote swarm counters re-counted on every safety re-fetch once the action left the capped log

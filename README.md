@@ -16,12 +16,16 @@ npm run build && npm start
 npm run typecheck
 ```
 
+**Going live with real pump.fun coins: follow [`GO-LIVE.md`](GO-LIVE.md)** (Supabase, keys, Vercel env,
+the engine schedule, the first launch, wiping test data). `npm run check:live` and `GET /api/health`
+show what is still missing.
+
 ## What's here (Phase 1)
 
 | Area | Where | Notes |
 | --- | --- | --- |
 | Theme engine | `themes/types.ts`, `themes/hive.ts`, `themes/pack.ts`, `themes/index.ts` | Copy, palette, fonts, verb names, shape language, rule parameters and the 3D scene all read from `theme`. |
-| Mock simulator | `lib/sim.ts` | 60 hives on a hex grid. Every 2–5 s a few hives earn fees; queens run SEAL / STORE / SWARM by rule; swarms fly between adjacent cells; the harvest runs every mock hour (60 s); hives starve after 6 mock hours of silence and are abandoned after 24. Deterministic seed so SSR, hydration and the OG image agree. |
+| Mock simulator | `lib/sim.ts` | Demo only (`NEXT_PUBLIC_DEMO_HIVES=1`, off by default): 60 hives on a hex grid. Every 2–5 s a few hives earn fees; queens run SEAL / STORE / SWARM by rule; swarms fly between adjacent cells; the harvest runs every mock hour (60 s); hives starve after 6 mock hours of silence and are abandoned after 24. Deterministic seed so SSR, hydration and the OG image agree. |
 | Store | `lib/store.ts` | Zustand. Ticks the simulator every 250 ms, exposes `world`, `stats`, night/day mode, sound, the session's founded hives, mock positions. |
 | The comb | `lib/comb3d.ts`, `components/comb/CombScene.tsx` | Three.js, orthographic camera at 30° tilt, instanced hex prisms (depth = holders, fill = honey, colour = state), physically based honey with transmission, UnrealBloom kept subtle, drag to pan, scroll / pinch to zoom, click a cell to open the hive. Every animation is driven by a `SceneEvent` emitted for one logged action. For `theme.scene === 'den'` the same renderer lays cells out on concentric rings with cylindrical cells. |
 | Bees | `lib/comb3d.ts` (`beeGeometry`, `writeBee`) | Instanced bees with a striped abdomen, golden thorax, dark head and four translucent wings, plus a soft shadow on the honey. They wander over their own cell, land on the rim to rest, and lift off again; ≤ 30 per cell (real count on hover). Each living cell has a queen: larger, slower, near the centre, white for the biggest hive. Starving cells' bees turn grey and drift off. |
@@ -68,8 +72,23 @@ they are real records on the server, so every visitor sees every hive appear on 
 ```
 npm run dev                 # mock mode, file store under .data/, live feed over SSE
 npm test                    # unit/integration tests (vitest)
-bash scripts/test-sql.sh    # the Supabase schema on a throwaway Postgres 16 (93 assertions)
+bash scripts/test-sql.sh    # the Supabase migrations + cleanup script on a throwaway Postgres 16 (148 assertions)
+npm run check:live          # is this environment ready for live mode? (reads .env.local / .env)
 ```
+
+The comb starts empty: no simulated hives unless `NEXT_PUBLIC_DEMO_HIVES=1` (local play). Preview
+launches are labelled as previews. To start over locally, stop the server and delete `.data` (or your
+`DATA_DIR`).
+
+### Only real hives in live mode
+
+With `LAUNCH_MODE=live` the public only ever sees real chain data (`lib/shared/visibility.ts`):
+`/api/hives`, `/api/hives/[ca]` (and its image), `/api/stream` and the browser's Supabase Realtime
+handling carry hives with status `live` only, and only actions / harvests that were really sent (no dry
+runs) for live hives. Preview rows left in a live database are ignored by the engine, never block a real
+launch's cell (`claim_live_cell`, migration 0002), and can be deleted with
+`supabase/cleanup-fake-data.sql`. A dry run's plan is shown to the admin in the JSON answer of
+`/api/cron/hourly` (`dryRunFeed`), never on the site.
 
 ### How other users' hives reach you
 
@@ -89,8 +108,8 @@ bash scripts/test-sql.sh    # the Supabase schema on a throwaway Postgres 16 (93
 
 **On Vercel you need Supabase for real multi-user.** Serverless instances do not share `/tmp`, so the
 file store is only for local development and single-server deployments. Setup:
-[`supabase/README.md`](supabase/README.md) (run `supabase/migrations/0001_hive.sql`, set the three
-Supabase env vars).
+[`GO-LIVE.md`](GO-LIVE.md) and [`supabase/README.md`](supabase/README.md) (run
+`supabase/migrations/0001_hive.sql` then `0002_live.sql`, set the three Supabase env vars).
 
 ### Launching
 
@@ -120,6 +139,8 @@ own (`instrumentation.ts`; `ENGINE_AUTORUN=0` turns it off). In production, call
   `GET /api/cron/refresh` with `Authorization: Bearer $CRON_SECRET`.
 
 In live mode the engine only **records** what it would do (`dryRun`) until you set `ENGINE_DRY_RUN=0`.
+Those records stay off the public site; the cron route's JSON (`dryRunFeed`) shows them. The engine
+writes when each job last ran (meta `engine:<mode>:lastRun:<job>`), which `/api/health` reports.
 
 ### Environment
 
@@ -130,12 +151,13 @@ In live mode the engine only **records** what it would do (`dryRun`) until you s
 | `SOLANA_RPC_URL` | public mainnet RPC | server RPC (use a paid one for live) |
 | `NEXT_PUBLIC_RPC` | public mainnet RPC | the wallet's RPC in the browser |
 | `QUEEN_KEY_SECRET` | mock only: a dev key in `DATA_DIR`, or derived from `SUPABASE_SERVICE_ROLE_KEY` (HKDF-SHA256) when Supabase is configured | 32-byte key (base64 or hex) that encrypts queen and mint keys; **required in live mode** |
-| `CRON_SECRET` | unset | bearer token for the cron routes (unset = only allowed in mock mode) |
+| `CRON_SECRET` | unset | bearer token for the cron routes (unset = only allowed in mock mode); 32+ random characters |
 | `ENGINE_DRY_RUN` | `1` | live mode: record actions without sending |
 | `HUB_WALLET`, `HUB_WALLET_SECRET`, `HUB_TOKEN_MINT` | unset | the harvest wallet and the $HIVE mint |
 | `HELIUS_API_KEY` | unset | holder counts (bees) and the holder list for abandon payouts, via Helius DAS |
 | `PRIORITY_FEE_SOL`, `SLIPPAGE_PCT` | `0.0005`, `10` | trade settings |
-| `NEXT_PUBLIC_DEMO_HIVES` | `1` | show the 60 simulated demo hives |
+| `NEXT_PUBLIC_DEMO_HIVES` | unset (off) | `1` shows the 60 simulated demo hives (local play; never in production). Read at build time too: redeploy after changing it |
+| `NEXT_PUBLIC_SITE_URL` | unset | the public URL (coin metadata links to it) |
 | `DATA_DIR` | `.data` (`/tmp/hive-data` on Vercel) | file store location |
 | `TRUST_PROXY` | unset | how many reverse proxies to trust for the client address (`X-Forwarded-For`). Ignored on Vercel, which sets it reliably. Unset on a self-hosted server: every client shares one rate-limit bucket (12 launch prepares per 10 min, 40 confirms/min, 120 status reads/min, 10 refunds per 10 min), so set it to `1` behind nginx/Caddy |
 
@@ -145,7 +167,9 @@ In live mode the engine only **records** what it would do (`dryRun`) until you s
   against their current docs: this sandbox could not reach them, so they are tested against mocks only.
 - Fund nothing until a full launch has been run end to end on mainnet with a small dev buy.
 - `GET /api/config` shows the mode; `liveModeProblems()` refuses live launches until the required
-  env vars are set.
+  env vars are set (and `QUEEN_KEY_SECRET` decodes to 32 bytes). `GET /api/health` reports that list plus
+  the Supabase schema / Realtime state, RPC reachability and the engine's last runs (booleans and counts
+  only, never a key); `npm run check:live` checks the same from a terminal with a fix for each problem.
 - PumpPortal transactions are checked before the queen signs them: only ComputeBudget, System, SPL
   Token / Token-2022, Associated Token, pump and PumpSwap programs are allowed, the priority fee is
   capped at 2 × `PRIORITY_FEE_SOL`, and a buy may not spend more than asked. If PumpPortal starts adding

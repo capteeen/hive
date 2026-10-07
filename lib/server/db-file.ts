@@ -35,7 +35,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import type { Cell } from '@/lib/types';
 import type { LaunchState, RemoteAction, RemoteHarvest, RemoteHive, StreamEvent } from '@/lib/shared/api';
 import { hiveImageMetaKey, hiveImagePath, isDataUrl } from '@/lib/shared/rows';
-import type { Db, LaunchRecord } from './db';
+import type { CellScope, Db, LaunchRecord, ListOpts } from './db';
 
 /** Retention caps (the UI only ever shows the newest slice). */
 export const FILE_DB_CAPS = { actions: 5000, harvests: 2000, pricesPerCa: 2000 } as const;
@@ -363,13 +363,13 @@ export class FileDb implements Db {
 
   /* ---------- actions / harvests ---------- */
 
-  async listActions(limit: number, ca?: string): Promise<RemoteAction[]> {
+  async listActions(limit: number, ca?: string, opts: ListOpts = {}): Promise<RemoteAction[]> {
     await this.ready();
     const n = Math.max(0, Math.floor(limit));
     const out: RemoteAction[] = [];
     for (const a of this.s.actions) {
       if (out.length >= n) break;
-      if (!ca || a.ca === ca) out.push(clone(a));
+      if ((!ca || a.ca === ca) && !(opts.real && a.dryRun)) out.push(clone(a));
     }
     return out;
   }
@@ -387,9 +387,10 @@ export class FileDb implements Db {
     });
   }
 
-  async listHarvests(limit: number): Promise<RemoteHarvest[]> {
+  async listHarvests(limit: number, opts: ListOpts = {}): Promise<RemoteHarvest[]> {
     await this.ready();
-    return this.s.harvests.slice(0, Math.max(0, Math.floor(limit))).map(clone);
+    const list = opts.real ? this.s.harvests.filter((h) => !h.dryRun) : this.s.harvests;
+    return list.slice(0, Math.max(0, Math.floor(limit))).map(clone);
   }
 
   async addHarvest(h: RemoteHarvest): Promise<void> {
@@ -407,7 +408,7 @@ export class FileDb implements Db {
 
   /* ---------- cells ---------- */
 
-  async claimCell(candidates: Cell[], launchId: string, expiresAt: number): Promise<Cell | null> {
+  async claimCell(candidates: Cell[], launchId: string, expiresAt: number, scope: CellScope = {}): Promise<Cell | null> {
     if (typeof launchId !== 'string' || !launchId) throw new Error('claimCell: missing launch id.');
     if (!Number.isFinite(expiresAt)) throw new Error('claimCell: invalid expiry.');
     return this.tx((t) => {
@@ -417,9 +418,16 @@ export class FileDb implements Db {
       s.claims = s.claims.filter((c) => c.expiresAt === null || c.expiresAt > now);
       let changed = s.claims.length !== before;
       let won: Cell | null = null;
+      const counts = this.counts(scope);
       for (const cand of candidates) {
         if (!isCellInt(cand)) continue;
-        if ([...s.hives.values()].some((h) => sameCell(h.cell, cand))) continue;
+        if ([...s.hives.values()].some((h) => counts.hive(h) && sameCell(h.cell, cand))) continue;
+        if (scope.liveOnly) {
+          // a preview launch's claim never blocks a real one: the live launch takes the cell over
+          const n = s.claims.length;
+          s.claims = s.claims.filter((c) => !(sameCell(c, cand) && c.launchId !== launchId && !counts.claim(c)));
+          if (s.claims.length !== n) changed = true;
+        }
         const held = s.claims.find((c) => sameCell(c, cand));
         if (held) {
           if (held.launchId !== launchId) continue;
@@ -463,12 +471,22 @@ export class FileDb implements Db {
     });
   }
 
-  async takenCells(now: number): Promise<Cell[]> {
+  async takenCells(now: number, scope: CellScope = {}): Promise<Cell[]> {
     await this.ready();
+    const counts = this.counts(scope);
     const out = new Map<string, Cell>();
-    for (const h of this.s.hives.values()) out.set(`${h.cell.q},${h.cell.r}`, { q: h.cell.q, r: h.cell.r });
-    for (const c of this.s.claims) if (c.expiresAt === null || c.expiresAt > now) out.set(`${c.q},${c.r}`, { q: c.q, r: c.r });
+    for (const h of this.s.hives.values()) if (counts.hive(h)) out.set(`${h.cell.q},${h.cell.r}`, { q: h.cell.q, r: h.cell.r });
+    for (const c of this.s.claims) if ((c.expiresAt === null || c.expiresAt > now) && counts.claim(c)) out.set(`${c.q},${c.r}`, { q: c.q, r: c.r });
     return [...out.values()];
+  }
+
+  /** Which hives and claims occupy a cell for `scope` (liveOnly: not preview hives, not mock launches' claims). */
+  private counts(scope: CellScope) {
+    const live = !!scope.liveOnly;
+    return {
+      hive: (h: RemoteHive) => !live || h.status !== 'mock',
+      claim: (c: Claim) => !live || this.s.launches.get(c.launchId)?.mode !== 'mock',
+    };
   }
 
   /* ---------- launches ---------- */

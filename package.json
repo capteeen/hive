@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check:live": "node scripts/check-live.mjs",
+    "test:sql": "bash scripts/test-sql.sh"
   },
   "dependencies": {
     "@solana/spl-token": "^0.4.15",

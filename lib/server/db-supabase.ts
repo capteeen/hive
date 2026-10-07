@@ -16,7 +16,7 @@ import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import type { Cell } from '@/lib/types';
 import type { LaunchMode, LaunchState, RemoteAction, RemoteHarvest, RemoteHive, StreamEvent } from '@/lib/shared/api';
 import { actionToRow, harvestToRow, hiveImageMetaKey, hiveImagePath, hiveToRow, isDataUrl, mapRows, rowToAction, rowToHarvest, rowToHive, rowToPrice, toIso, toMs, toNum } from '@/lib/shared/rows';
-import type { Db, LaunchRecord } from './db';
+import type { CellScope, Db, LaunchRecord, ListOpts } from './db';
 
 /** PostgREST's default max rows per request; listHives / takenCells page through it. */
 const PAGE = 1000;
@@ -125,6 +125,9 @@ interface PgError {
   code?: string;
 }
 
+/** PostgREST could not find the function (PGRST202), or Postgres says it does not exist (42883). */
+const isMissingFunction = (err: PgError) => err.code === 'PGRST202' || err.code === '42883';
+
 /** Throw a short error. Only `message`/`code` are used: PostgREST `details` can echo row values. */
 function fail(what: string, err: PgError): never {
   throw new Error(`[db] ${what} failed: ${err.message}${err.code ? ` (${err.code})` : ''}`);
@@ -135,6 +138,8 @@ export class SupabaseDb implements Db {
   private readonly sb: SupabaseClient;
   /** ca -> last prune time (ms), so pruning old prices runs at most hourly per hive per process. */
   private readonly pruned = new Map<string, number>();
+  /** False once claim_live_cell() turned out to be missing (migration 0002 not applied). */
+  private liveClaim = true;
 
   /** `opts.fetch` lets tests stub the network. */
   constructor(url: string, serviceKey: string, opts: { fetch?: typeof fetch } = {}) {
@@ -176,11 +181,12 @@ export class SupabaseDb implements Db {
 
   /* ---------- actions / harvests ---------- */
 
-  async listActions(limit: number, ca?: string): Promise<RemoteAction[]> {
+  async listActions(limit: number, ca?: string, opts: ListOpts = {}): Promise<RemoteAction[]> {
     const n = Math.max(0, Math.floor(limit));
     if (!n) return [];
     let q = this.sb.from('actions').select('*');
     if (ca) q = q.eq('ca', ca);
+    if (opts.real) q = q.eq('dry_run', false);
     const { data, error } = await q.order('at', { ascending: false }).limit(n);
     if (error) fail('listActions', error);
     return mapRows(data, rowToAction);
@@ -192,10 +198,12 @@ export class SupabaseDb implements Db {
     if (error) fail('addAction', error);
   }
 
-  async listHarvests(limit: number): Promise<RemoteHarvest[]> {
+  async listHarvests(limit: number, opts: ListOpts = {}): Promise<RemoteHarvest[]> {
     const n = Math.max(0, Math.floor(limit));
     if (!n) return [];
-    const { data, error } = await this.sb.from('harvests').select('*').order('at', { ascending: false }).limit(n);
+    let q = this.sb.from('harvests').select('*');
+    if (opts.real) q = q.eq('dry_run', false);
+    const { data, error } = await q.order('at', { ascending: false }).limit(n);
     if (error) fail('listHarvests', error);
     return mapRows(data, rowToHarvest);
   }
@@ -207,13 +215,26 @@ export class SupabaseDb implements Db {
 
   /* ---------- cells ---------- */
 
-  async claimCell(candidates: Cell[], launchId: string, expiresAt: number): Promise<Cell | null> {
+  /**
+   * `scope.liveOnly` uses claim_live_cell() (supabase/migrations/0002_live.sql), which ignores preview
+   * hives and replaces a mock launch's claim. Without 0002 it falls back to claim_cell(), where preview
+   * data still blocks its cells (the launch then gets the nearest free one).
+   */
+  async claimCell(candidates: Cell[], launchId: string, expiresAt: number, scope: CellScope = {}): Promise<Cell | null> {
     if (!launchId) throw new Error('claimCell: missing launch id.');
     if (!Number.isFinite(expiresAt)) throw new Error('claimCell: invalid expiry.');
     for (const c of candidates) {
       if (!Number.isInteger(c?.q) || !Number.isInteger(c?.r)) continue;
-      const { data, error } = await this.sb.rpc('claim_cell', { q: c.q, r: c.r, launch: launchId, expires: toIso(expiresAt) });
-      if (error) fail('claim_cell', error);
+      const args = { q: c.q, r: c.r, launch: launchId, expires: toIso(expiresAt) };
+      let fn = scope.liveOnly && this.liveClaim ? 'claim_live_cell' : 'claim_cell';
+      let { data, error } = await this.sb.rpc(fn, args);
+      if (error && fn === 'claim_live_cell' && isMissingFunction(error)) {
+        this.liveClaim = false;
+        console.warn('[hive] claim_live_cell() is missing: run supabase/migrations/0002_live.sql. Preview hives block their cells until then.');
+        fn = 'claim_cell';
+        ({ data, error } = await this.sb.rpc(fn, args));
+      }
+      if (error) fail(fn, error);
       if (data === true) return { q: c.q, r: c.r };
     }
     return null;
@@ -230,27 +251,45 @@ export class SupabaseDb implements Db {
     if (error) fail('releaseCell', error);
   }
 
-  async takenCells(now: number): Promise<Cell[]> {
+  async takenCells(now: number, scope: CellScope = {}): Promise<Cell[]> {
+    // Without claim_live_cell (0002 missing) claims go through claim_cell, which preview data still
+    // blocks: offer only cells it can grant, or a comb whose only hive is a preview one has none to give.
+    const liveOnly = !!scope.liveOnly && this.liveClaim;
     const out = new Map<string, Cell>();
     for (let from = 0; ; from += PAGE) {
-      const { data, error } = await this.sb.from('hives').select('cell_q,cell_r').order('ca', { ascending: true }).range(from, from + PAGE - 1);
+      let q = this.sb.from('hives').select('cell_q,cell_r');
+      if (liveOnly) q = q.neq('status', 'mock');
+      const { data, error } = await q.order('ca', { ascending: true }).range(from, from + PAGE - 1);
       if (error) fail('takenCells(hives)', error);
       for (const r of (data ?? []) as { cell_q: number; cell_r: number }[]) out.set(`${r.cell_q},${r.cell_r}`, { q: r.cell_q, r: r.cell_r });
       if (!data || data.length < PAGE) break;
     }
+    const mock = liveOnly ? await this.mockLaunchIds() : null;
     for (let from = 0; ; from += PAGE) {
       const { data, error } = await this.sb
         .from('cell_claims')
-        .select('q,r')
+        .select('q,r,launch_id')
         .or(`expires_at.is.null,expires_at.gt."${toIso(now)}"`)
         .order('q', { ascending: true })
         .order('r', { ascending: true })
         .range(from, from + PAGE - 1);
       if (error) fail('takenCells(claims)', error);
-      for (const r of (data ?? []) as { q: number; r: number }[]) out.set(`${r.q},${r.r}`, { q: r.q, r: r.r });
+      for (const r of (data ?? []) as { q: number; r: number; launch_id: string }[]) if (!mock?.has(r.launch_id)) out.set(`${r.q},${r.r}`, { q: r.q, r: r.r });
       if (!data || data.length < PAGE) break;
     }
     return [...out.values()];
+  }
+
+  /** Ids of mock-mode launches (a live database normally has none). */
+  private async mockLaunchIds(): Promise<Set<string>> {
+    const ids = new Set<string>();
+    for (let from = 0; ; from += PAGE) {
+      const { data, error } = await this.sb.from('launches').select('id').eq('mode', 'mock').order('id', { ascending: true }).range(from, from + PAGE - 1);
+      if (error) fail('takenCells(launches)', error);
+      for (const r of (data ?? []) as { id: string }[]) ids.add(r.id);
+      if (!data || data.length < PAGE) break;
+    }
+    return ids;
   }
 
   /* ---------- launches ---------- */

@@ -2,7 +2,7 @@
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { useWallet } from '@solana/wallet-adapter-react';
-import { useHive } from '@/lib/store';
+import { demoOn, useHive } from '@/lib/store';
 import { useUI } from '@/lib/ui';
 import { theme } from '@/themes';
 import { fmtNum, fmtSol, short } from '@/lib/format';
@@ -19,6 +19,7 @@ export default function MePage() {
   const hives = useHive((s) => s.world.hives);
   const mine = useHive((s) => s.mine);
   const positions = useHive((s) => s.positions);
+  const demo = useHive((s) => demoOn(s.config));
   const claimed = useHive((s) => s.claimed);
   const claim = useHive((s) => s.claim);
   const biggest = useHive((s) => s.world.biggestCa);
@@ -49,7 +50,7 @@ export default function MePage() {
       </div>
       {!publicKey && (
         <div className="shape-card glass mt-6 p-4 text-sm text-text/70">
-          Connect a wallet to see your own {theme.unitPlural} and positions. Below is a demo wallet so the page is never empty. In Phase 2 positions come from DAS holder lookups.
+          Connect a wallet to see your own {theme.unitPlural}{demo ? ' and positions. Below is a demo wallet so the page is never empty.' : '.'}
         </div>
       )}
 
@@ -86,6 +87,13 @@ export default function MePage() {
               </tr>
             </thead>
             <tbody>
+              {positions.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="px-4 py-6 text-sm text-text/60">
+                    Nothing yet. Coins you hold will show up here.
+                  </td>
+                </tr>
+              )}
               {positions.map((p) => {
                 const h = hives[p.ca];
                 if (!h) return null;

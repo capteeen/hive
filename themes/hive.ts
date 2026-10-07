@@ -41,6 +41,7 @@ export const hive: Theme = {
   },
   shape: 'hex',
   scene: 'comb',
+  ambience: { critter: 'bee', honey: true },
   copy: {
     eyebrow: 'Every coin is a beehive. Every holder is a bee.',
     tagline: 'Launch a coin, get a queen. She seals, stores and swarms with your fees, every hour, on-chain.',

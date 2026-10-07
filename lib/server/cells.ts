@@ -6,17 +6,20 @@ import 'server-only';
 import { demoCells } from '@/lib/sim';
 import { cellKey, hexDistance, neighbors, spiralIndexOf } from '@/lib/hex';
 import type { Cell } from '@/lib/types';
-import type { Db } from './db';
+import type { CellScope, Db } from './db';
 import { config } from './config';
 
 const ORIGIN: Cell = { q: 0, r: 0 };
 const order = (c: Cell) => spiralIndexOf(c);
 
-/** Free edge cells, best first: the preferred cell, then nearest to it, then spiral order. */
-export async function candidateCells(db: Db, preferred: Cell | null, now: number, limit = 40): Promise<Cell[]> {
+/**
+ * Free edge cells, best first: the preferred cell, then nearest to it, then spiral order.
+ * `scope.liveOnly` (live launches): preview hives and mock launches' claims are not on the comb.
+ */
+export async function candidateCells(db: Db, preferred: Cell | null, now: number, limit = 40, scope: CellScope = {}): Promise<Cell[]> {
   const taken = new Set<string>();
   if (config.demoHives) for (const c of demoCells()) taken.add(cellKey(c));
-  for (const c of await db.takenCells(now)) taken.add(cellKey(c));
+  for (const c of await db.takenCells(now, scope)) taken.add(cellKey(c));
   if (taken.size === 0) return [ORIGIN];
   const frontier = new Map<string, Cell>();
   for (const k of taken) {
@@ -33,10 +36,10 @@ export async function candidateCells(db: Db, preferred: Cell | null, now: number
 }
 
 /** Reserve a cell for a launch. `changed` = the preferred cell was not available. */
-export async function claimLaunchCell(db: Db, preferred: Cell | null, launchId: string, expiresAt: number, now = Date.now()): Promise<{ cell: Cell; changed: boolean }> {
+export async function claimLaunchCell(db: Db, preferred: Cell | null, launchId: string, expiresAt: number, now = Date.now(), scope: CellScope = {}): Promise<{ cell: Cell; changed: boolean }> {
   for (let attempt = 0; attempt < 3; attempt++) {
-    const candidates = await candidateCells(db, preferred, now);
-    const cell = await db.claimCell(candidates, launchId, expiresAt);
+    const candidates = await candidateCells(db, preferred, now, 40, scope);
+    const cell = await db.claimCell(candidates, launchId, expiresAt, scope);
     if (cell) return { cell, changed: !!preferred && (cell.q !== preferred.q || cell.r !== preferred.r) };
   }
   throw new Error('No free cell could be reserved. Try again in a moment.');

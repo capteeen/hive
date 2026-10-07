@@ -4,6 +4,11 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import type { HiveDetailResponse } from '@/lib/shared/rows';
 import type { LaunchStatusResponse, PublicConfig, RemoteHarvest, RemoteHive } from '@/lib/shared/api';
 
+// These cases exercise the demo hives a NEXT_PUBLIC_DEMO_HIVES=1 build shows before /api/config loads.
+vi.hoisted(() => {
+  process.env.NEXT_PUBLIC_DEMO_HIVES = '1';
+});
+
 /**
  * Client view regressions (final review, client group):
  *   #19 HarvestPage linked made-up (demo / mock) harvest signatures to Solscan

@@ -1,5 +1,5 @@
 import { ImageResponse } from 'next/og';
-import { createWorld, SEED } from '@/lib/sim';
+import { hiveSummary } from '@/lib/server/hive-summary';
 import { theme } from '@/themes';
 
 export const size = { width: 1200, height: 630 };
@@ -12,18 +12,18 @@ const SHAPE = theme.shape === 'hex' ? HEX : 'circle(50%)';
 /**
  * OG image per unit: a faux-3D render of its cell (depth = holders, fill = honey,
  * colour = state), name, honey, bees and state. Built from clipped divs so it
- * renders in Satori without WebGL.
+ * renders in Satori without WebGL. Only a hive the public may see (or a demo hive while demo hives are on)
+ * gets its numbers; any other address renders an empty cell.
  */
-export default function OG({ params }: { params: { ca: string } }) {
-  const world = createWorld(SEED);
-  const h = world.hives[params.ca];
+export default async function OG({ params }: { params: { ca: string } }) {
+  const h = await hiveSummary(params.ca);
   const p = theme.palette;
   const name = h?.name ?? `A ${theme.unit}`;
   const ticker = h?.ticker ?? '';
   const honey = h?.honey ?? 0;
   const bees = h?.bees ?? 0;
   const state = h?.state ?? 'working';
-  const biggest = !!h && h.ca === world.biggestCa;
+  const biggest = !!h?.biggest;
   const liquid = state === 'abandoned' ? '#3a362f' : state === 'starving' ? p.starving : biggest ? p.royal : p.accent;
   const wallL = state === 'working' ? '#5a3d10' : '#2f2b27';
   const wallR = state === 'working' ? '#8a5f1c' : '#45403a';

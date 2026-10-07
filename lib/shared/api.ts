@@ -80,6 +80,8 @@ export interface PublicConfig {
   supabaseAnonKey?: string;
   demoHives: boolean;
   costs: { launchCost: number; queenReserve: number; maxDevBuy: number };
+  /** The real $HIVE mint (HUB_TOKEN_MINT), once it exists. Public on chain anyway. */
+  hubTokenMint?: string;
 }
 
 export interface HivesResponse {

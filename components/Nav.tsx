@@ -9,6 +9,9 @@ import { installClickSounds, sfx } from '@/lib/sfx';
 import { useEffect } from 'react';
 import HexButton from './HexButton';
 import HarvestCountdown from './HarvestCountdown';
+import { HoneyDrips } from './fx/Honey';
+import { useAmbience } from './fx/ambienceStore';
+import { ambienceOf } from './fx/swarmModel';
 
 const WalletButton = dynamic(() => import('./WalletButton'), { ssr: false });
 const LaunchWizard = dynamic(() => import('./launch/LaunchWizard'), { ssr: false });
@@ -21,6 +24,8 @@ const links = [
   { href: '/how', label: 'How' },
   { href: '/me', label: 'Me' },
 ];
+const amb = ambienceOf(theme);
+const hasAmbience = !!amb.critter || amb.honey;
 function cap(s: string) {
   return s[0].toUpperCase() + s.slice(1);
 }
@@ -36,14 +41,21 @@ export default function Nav() {
   const toggleSfx = useHive((s) => s.toggleSfx);
   const preview = useHive((s) => s.config?.launchMode === 'mock');
   const feed = useHive((s) => s.feed);
+  const ambience = useAmbience((s) => s.on);
+  const toggleAmbience = useAmbience((s) => s.toggle);
+  const loadAmbience = useAmbience((s) => s.load);
   useEffect(() => installClickSounds(), []);
+  useEffect(() => loadAmbience(), [loadAmbience]);
   return (
     <>
       <header className="fixed inset-x-0 top-0 z-40 border-b border-accent/10 bg-night/60 backdrop-blur-xl">
         <div className="mx-auto flex h-16 max-w-[1400px] items-center gap-4 px-4 sm:px-6">
           <div className="flex shrink-0 items-center gap-2.5">
             <Link href="/" className="flex items-center gap-2.5">
-              <span className="shape-hex inline-block h-7 w-7 bg-accent glow" />
+              {/* data-perch: the ambient bees may land on the logo */}
+              <span data-perch className={`shape-hex inline-flex h-7 w-7 items-center justify-center bg-accent glow${amb.critter ? ' logo-honey' : ''}`}>
+                {amb.critter === 'bee' && <LogoBee />}
+              </span>
               {/* the Preview chip sits under the name so the crowded header gains almost no width */}
               <span className="flex flex-col items-start leading-none">
                 <span className="font-heading text-lg font-semibold leading-7 tracking-tight">{theme.name}</span>
@@ -92,6 +104,7 @@ export default function Nav() {
             >
               <SpeakerIcon on={fx} />
             </button>
+            {hasAmbience && <AmbienceToggle on={ambience} onToggle={toggleAmbience} className="hidden h-9 sm:inline-flex" />}
             <button onClick={toggleMode} className="shape-btn btn-ghost hidden h-9 items-center text-xs sm:inline-flex" aria-label="Toggle daylight mode">
               {mode === 'night' ? 'Daylight' : 'Night'}
             </button>
@@ -113,12 +126,14 @@ export default function Nav() {
             </Link>
           ))}
           <span className="ml-auto flex shrink-0 items-center gap-2 sm:hidden">
+            {hasAmbience && <AmbienceToggle on={ambience} onToggle={toggleAmbience} className="inline-flex h-7" />}
             <button onClick={toggleMode} className="shape-btn btn-ghost inline-flex h-7 items-center text-[11px]" aria-label="Toggle daylight mode">
               {mode === 'night' ? 'Day' : 'Night'}
             </button>
             <WalletButton />
           </span>
         </nav>
+        {amb.honey && <HoneyDrips />}
       </header>
       <LaunchWizard />
       <Hum />
@@ -136,6 +151,48 @@ const FEED: Record<'connecting' | 'live' | 'offline', { label: string; cls: stri
 function FeedDot({ feed }: { feed: 'connecting' | 'live' | 'offline' }) {
   const f = FEED[feed];
   return <span role="img" aria-label={f.label} title={f.label} className={`relative inline-block h-2 w-2 shrink-0 rounded-full transition-colors duration-600 ${f.cls}`} />;
+}
+
+/** The nav's "Bees" switch: ambient motion (the swarm, splashes, honey drips) on or off. */
+function AmbienceToggle({ on, onToggle, className }: { on: boolean; onToggle: () => void; className: string }) {
+  return (
+    <button
+      onClick={onToggle}
+      data-sfx="toggle"
+      className={`shape-btn btn-ghost items-center text-xs ${className}`}
+      aria-pressed={on}
+      aria-label={`Ambient ${theme.holderPlural}`}
+      title={on ? `Flying ${theme.holderPlural} and honey motion on` : `Flying ${theme.holderPlural} and honey motion off`}
+    >
+      <BeeIcon on={on} />
+    </button>
+  );
+}
+
+/** The logo's little bee: a dark silhouette on the honey hexagon. */
+function LogoBee() {
+  return (
+    <svg width="18" height="18" viewBox="-10 -10 20 20" aria-hidden className="text-[#22160A]">
+      <ellipse cx="-4.5" cy="-3.4" rx="4.2" ry="2.3" transform="rotate(-28 -4.5 -3.4)" fill="#FFF6DA" fillOpacity="0.75" />
+      <ellipse cx="0.4" cy="-4.4" rx="3.6" ry="2" transform="rotate(-62 0.4 -4.4)" fill="#FFF6DA" fillOpacity="0.6" />
+      <ellipse cx="-1.2" cy="1.6" rx="5.6" ry="3.9" fill="currentColor" />
+      <path d="M-4.6 -1.6v6.4M-1.8 -2.3v7.8M1 -2v7.2" stroke="#F5A524" strokeWidth="1.3" />
+      <circle cx="5.4" cy="0.8" r="2.6" fill="currentColor" />
+      <path d="M6.2 -1.4q1.2 -2.6 3.2 -3.4" fill="none" stroke="currentColor" strokeWidth="0.9" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function BeeIcon({ on }: { on: boolean }) {
+  return (
+    <svg width="18" height="16" viewBox="-11 -9 22 18" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <ellipse cx="-3" cy="-4" rx="4" ry="2.4" transform="rotate(-25 -3 -4)" opacity={on ? 1 : 0.5} />
+      <ellipse cx="-1" cy="2" rx="6" ry="4" fill={on ? 'currentColor' : 'none'} fillOpacity="0.18" />
+      <path d="M-3 -1.6v7.2M0 -2v8" />
+      <circle cx="6.2" cy="1.4" r="2.2" />
+      {!on && <path d="M-9 7 9 -7" />}
+    </svg>
+  );
 }
 
 function SpeakerIcon({ on }: { on: boolean }) {

@@ -142,7 +142,11 @@ export default function CombExplorer() {
                 </li>
               );
             })}
-            {!list.length && <li className="px-4 py-6 text-sm text-text/50">No {theme.unitPlural} match.</li>}
+            {!list.length && (
+              <li className="px-4 py-6 text-sm text-text/50" data-empty={hives.length ? undefined : 'hives'}>
+                {hives.length ? `No ${theme.unitPlural} match.` : `No ${theme.unitPlural} yet. Click the empty cell in the middle to found the first one.`}
+              </li>
+            )}
           </ol>
         )}
       </div>

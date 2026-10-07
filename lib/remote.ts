@@ -10,6 +10,9 @@
  *     3. GET /api/hives             -> store.applyRemote(data, { initial: true })
  *     4. stream events are batched (~120ms) into store.applyRemote; every (re)connect and every 60s
  *        the full list is re-fetched as a safety net for anything missed while disconnected.
+ *   Live launch mode: only real chain data reaches the store (lib/shared/visibility.ts): live hives,
+ *   and real (not dry-run) actions and harvests of live hives. The server already filters its list and
+ *   SSE feed; Supabase Realtime delivers every row the anon key may SELECT, so the browser filters too.
  *   store.feed: 'connecting' until the feed first opens, 'live' while open, 'offline' while lost.
  *     Anything heard on the feed (an event, or the SSE ping every 20s) marks it live again, and a
  *     browser 'online' re-checks a connection that survived an 'offline' blip. An SSE connection that
@@ -21,6 +24,7 @@
 import { useHive } from './store';
 import type { HivesResponse, PublicConfig, RemoteAction, RemoteHarvest, RemoteHive } from './shared/api';
 import { rowToAction, rowToHarvest, rowToHive, type HiveDetailResponse } from './shared/rows';
+import { publicView } from './shared/visibility';
 
 const SAFETY_REFETCH_MS = 60_000;
 const BATCH_MS = 120;
@@ -120,6 +124,13 @@ function run(): () => void {
 
   /* ----- applying data: newest wins per hive, stream events batched ----- */
 
+  /** What the public may see in this launch mode; hives already in the store count for actions and harvests. */
+  const visible = (data: { hives: RemoteHive[]; actions: RemoteAction[]; harvests: RemoteHarvest[] }) => {
+    const mode = store().config?.launchMode ?? 'mock';
+    const world = store().world;
+    return publicView(mode, data, (ca) => world.hives[ca]?.source === 'remote' && world.hives[ca]?.status === 'live');
+  };
+
   /** updatedAt of the newest version of each hive applied so far (drops stale, out-of-order copies). */
   const applied = new Map<string, number>();
   let initialDone = false;
@@ -156,12 +167,11 @@ function run(): () => void {
       if (!image) missingImage = true;
       return { ...h, image };
     });
-    const actions = pending.actions;
-    const harvests = pending.harvests;
+    const shown = visible({ hives, actions: pending.actions, harvests: pending.harvests });
     pending.hives = new Map();
     pending.actions = [];
     pending.harvests = [];
-    if (hives.length || actions.length || harvests.length) store().applyRemote({ hives, actions, harvests });
+    if (shown.hives.length || shown.actions.length || shown.harvests.length) store().applyRemote(shown);
     if (missingImage) scheduleRefetch(1_500);
   }
 
@@ -180,7 +190,7 @@ function run(): () => void {
         if (stopped) return;
         lastFetchAt = Date.now();
         const hives = fresh((data.hives ?? []).filter(isHive));
-        store().applyRemote({ hives, actions: (data.actions ?? []).filter(isAction), harvests: (data.harvests ?? []).filter(isHarvest) }, { initial: true });
+        store().applyRemote(visible({ hives, actions: (data.actions ?? []).filter(isAction), harvests: (data.harvests ?? []).filter(isHarvest) }), { initial: true });
         if (!initialDone) {
           initialDone = true;
           flush(); // stream events that arrived while the first list was loading
