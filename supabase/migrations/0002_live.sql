@@ -14,6 +14,13 @@
 -- Re-running this file is safe: every statement is IF [NOT] EXISTS / CREATE OR REPLACE, grants are
 -- re-applied. 0001 stays valid on its own; the server falls back to claim_cell without this file.
 
+-- 0001 must have run first: say so plainly instead of failing on a missing table.
+do $guard$ begin
+  if to_regclass('public.hives') is null then
+    raise exception 'HIVE tables are missing. Run supabase/setup.sql (the whole file) first.';
+  end if;
+end $guard$;
+
 -- ---------------------------------------------------------------- one cell per hive, per status
 
 alter table public.hives drop constraint if exists hives_cell_unique;

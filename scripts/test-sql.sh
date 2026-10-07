@@ -135,4 +135,25 @@ race "try_lock on one name" "select public.try_lock('race', now() + interval '1 
 psql_db -c "insert into public.launches (id, mode, state, owner, payload, queen_wallet, mint_pubkey, mint_secret_enc, cell_q, cell_r, lamports, expires_at) values ('race-mock', 'mock', 'reserved', 'o', '{}', 'race-q', 'race-m', 'v1.x.x.x', 41, 41, 0, now() + interval '10 minutes'); select public.claim_cell(41, 41, 'race-mock', now() + interval '10 minutes')" >/dev/null
 race "claim_live_cell on a preview launch's cell" "select public.claim_live_cell(41, 41, 'race-live-%s', now() + interval '10 minutes')"
 
+echo "== supabase/setup.sql"
+fresh="$BASE/setup.sql.fresh"
+bash "$ROOT/scripts/build-setup-sql.sh" "$fresh"
+cmp -s "$fresh" "$ROOT/supabase/setup.sql" || { echo "supabase/setup.sql is out of date: run scripts/build-setup-sql.sh" >&2; exit 1; }
+"$PSQL_BIN" -X -q -v ON_ERROR_STOP=1 -d postgres -c "create database ${DB}_setup" >/dev/null
+setup_db() { "$PSQL_BIN" -X -q -v ON_ERROR_STOP=1 -v VERBOSITY=terse -d "${DB}_setup" "$@"; }
+setup_db -o /dev/null -f "$ROOT/supabase/tests/00_supabase_emulation.sql" >/dev/null 2>&1
+# the cleanup and 0002 refuse to run on an empty database, with a message that names setup.sql
+for f in supabase/cleanup-fake-data.sql supabase/migrations/0002_live.sql; do
+  if out="$(setup_db -o /dev/null -f "$ROOT/$f" 2>&1)" || ! grep -q 'Run supabase/setup.sql' <<<"$out"; then
+    echo "$f on an empty database did not stop with the setup.sql message: $out" >&2; exit 1
+  fi
+done
+setup_db -o /dev/null -f "$ROOT/supabase/setup.sql" >/dev/null 2>&1 || { setup_db -o /dev/null -f "$ROOT/supabase/setup.sql"; exit 1; }
+setup_db -o /dev/null -f "$ROOT/supabase/setup.sql" >/dev/null 2>&1 || { echo "setup.sql is not re-runnable" >&2; exit 1; }
+setup_db -o /dev/null -f "$ROOT/supabase/cleanup-fake-data.sql" >/dev/null 2>&1 || { echo "cleanup failed after setup.sql" >&2; exit 1; }
+[ "$(setup_db -tA -c "select to_regclass('public.hives') is not null and to_regprocedure('public.claim_live_cell(integer,integer,text,timestamptz)') is not null")" = t ] \
+  || { echo "setup.sql did not create the schema" >&2; exit 1; }
+echo "   ok - setup.sql builds the schema on an empty database, re-runs, and the guards name it"
+PASSED=$((PASSED + 1))
+
 echo "ALL SQL TESTS PASSED ($PASSED assertions)"

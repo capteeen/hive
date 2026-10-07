@@ -72,7 +72,7 @@ they are real records on the server, so every visitor sees every hive appear on 
 ```
 npm run dev                 # mock mode, file store under .data/, live feed over SSE
 npm test                    # unit/integration tests (vitest)
-bash scripts/test-sql.sh    # the Supabase migrations + cleanup script on a throwaway Postgres 16 (148 assertions)
+bash scripts/test-sql.sh    # the Supabase migrations + cleanup script on a throwaway Postgres 16
 npm run check:live          # is this environment ready for live mode? (reads .env.local / .env)
 ```
 
@@ -109,7 +109,7 @@ launch's cell (`claim_live_cell`, migration 0002), and can be deleted with
 **On Vercel you need Supabase for real multi-user.** Serverless instances do not share `/tmp`, so the
 file store is only for local development and single-server deployments. Setup:
 [`GO-LIVE.md`](GO-LIVE.md) and [`supabase/README.md`](supabase/README.md) (run
-`supabase/migrations/0001_hive.sql` then `0002_live.sql`, set the three Supabase env vars).
+`supabase/setup.sql` in the SQL editor, set the three Supabase env vars).
 
 ### Launching
 

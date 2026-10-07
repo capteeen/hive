@@ -21,6 +21,13 @@
 -- Local file store (no Supabase): stop the server and delete the DATA_DIR folder (default `.data`)
 -- instead. That removes everything, real data included, so only do it on a test machine.
 
+-- The tables must exist (run supabase/setup.sql first).
+do $guard$ begin
+  if to_regclass('public.hives') is null then
+    raise exception 'HIVE tables are missing. Run supabase/setup.sql (the whole file) first.';
+  end if;
+end $guard$;
+
 begin;
 
 -- What counts as preview data, decided once, before anything is deleted.

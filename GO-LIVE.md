@@ -25,10 +25,12 @@ Keep `.env.example` open: it lists every variable with a one-line explanation.
 ## 2. Create the tables (SQL editor)
 
 1. In Supabase: **SQL Editor** → **New query**.
-2. Open `supabase/migrations/0001_hive.sql` from this repo, copy **all** of it, paste, **Run**.
+2. Open `supabase/setup.sql` from this repo, copy **all** of it (it is long: select all), paste, **Run**.
    It should end with "Success. No rows returned".
-3. New query again: paste all of `supabase/migrations/0002_live.sql`, **Run**.
-4. Both files are safe to run again; if you are unsure whether a step went through, run it again.
+3. It is safe to run again; if you are unsure whether it went through, run it again.
+
+If you see `relation "public.hives" does not exist`, the tables were not created yet: run `setup.sql`
+first. `cleanup-fake-data.sql` (step 13) only works after it.
 
 ## 3. Check that Realtime is on
 
@@ -36,7 +38,7 @@ Browsers hear about new hives through Supabase Realtime.
 
 1. **Database** → **Publications** → `supabase_realtime`.
 2. `hives`, `actions` and `harvests` must be switched on. Migration 0001 does this; if one is off, switch
-   it on here (or run 0001 again).
+   it on here (or run `setup.sql` again).
 3. Step 9 checks this for you too.
 
 ## 4. Copy the three Supabase values
