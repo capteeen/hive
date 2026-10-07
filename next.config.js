@@ -1,6 +1,8 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
+  // instrumentation.ts starts the in-process engine ticker in mock mode
+  experimental: { instrumentationHook: true },
   transpilePackages: ['three'],
   images: { remotePatterns: [{ protocol: 'https', hostname: '**' }] },
   webpack: (config) => {
