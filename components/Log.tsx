@@ -4,7 +4,7 @@ import { useNow } from '@/lib/useNow';
 import { useHive } from '@/lib/store';
 import { theme } from '@/themes';
 import { fmtSol, timeAgo, txUrl, short } from '@/lib/format';
-import { VerbBadge } from './Badges';
+import { DryRunTag, SourceBadge, VerbBadge, isDryRun, isOnChain, offChainReason, stripDryRun } from './Badges';
 import Avatar from './Avatar';
 import type { Action } from '@/lib/types';
 
@@ -19,6 +19,9 @@ export default function Log({ ca, limit = 12, className = '', compact = false }:
         const h = hives[a.ca];
         const t = a.targetCa ? hives[a.targetCa] : undefined;
         if (!h) return null;
+        const dry = isDryRun(a.reason);
+        // Only live hives have real transactions; demo / preview signatures are made up.
+        const realTx = !!a.txSig && !dry && isOnChain(h);
         return (
           <li key={a.id} className="log-in flex items-start gap-3 px-4 py-3">
             {!compact && (
@@ -32,6 +35,8 @@ export default function Log({ ca, limit = 12, className = '', compact = false }:
                 <Link href={`/hive/${h.ca}`} className="font-heading font-semibold tracking-tight hover:text-accent">
                   {h.name}
                 </Link>
+                {/* in a hive's own log its badge sits in the page header: only tag other hives */}
+                {h.ca !== ca && <SourceBadge hive={h} size="xs" />}
                 {t && (
                   <>
                     <span className="text-text/40">→</span>
@@ -40,15 +45,25 @@ export default function Log({ ca, limit = 12, className = '', compact = false }:
                     </Link>
                   </>
                 )}
+                {dry && <DryRunTag />}
                 {a.amount > 0 && <span className="ml-auto tabular-nums text-text/80">{fmtSol(a.amount, 3)}</span>}
               </div>
-              <p className="mt-1 text-xs leading-relaxed text-text/60">{a.reason}</p>
+              <p className="mt-1 text-xs leading-relaxed text-text/60" title={dry ? a.reason : undefined}>
+                {stripDryRun(a.reason)}
+              </p>
               <div className="mt-1 flex items-center gap-3 text-[11px] text-text/45">
                 <span>{now === null ? '…' : timeAgo(a.at, now)}</span>
-                {a.txSig && (
-                  <a href={txUrl(a.txSig)} target="_blank" rel="noreferrer" className="text-accent/80 hover:text-accent">
-                    tx {short(a.txSig, 4)} ↗
+                {realTx ? (
+                  <a href={txUrl(a.txSig!)} target="_blank" rel="noreferrer" className="text-accent/80 hover:text-accent">
+                    tx {short(a.txSig!, 4)} ↗
                   </a>
+                ) : (
+                  a.txSig &&
+                  !dry && (
+                    <span className="cursor-help text-text/35" title={`Simulated transaction. ${offChainReason(h)}`}>
+                      tx {short(a.txSig, 4)}
+                    </span>
+                  )
                 )}
               </div>
             </div>

@@ -5,6 +5,7 @@ import { WalletModalProvider } from '@solana/wallet-adapter-react-ui';
 import { PhantomWalletAdapter } from '@solana/wallet-adapter-phantom';
 import { SolflareWalletAdapter } from '@solana/wallet-adapter-solflare';
 import { useHive } from '@/lib/store';
+import RemoteSync from '@/components/RemoteSync';
 import { theme } from '@/themes';
 import '@solana/wallet-adapter-react-ui/styles.css';
 
@@ -23,7 +24,11 @@ export default function Providers({ children }: { children: React.ReactNode }) {
   return (
     <ConnectionProvider endpoint={ENDPOINT}>
       <WalletProvider wallets={wallets} autoConnect>
-        <WalletModalProvider>{children}</WalletModalProvider>
+        <WalletModalProvider>
+          {/* other users' hives + "which hives are mine" (needs the wallet context) */}
+          <RemoteSync />
+          {children}
+        </WalletModalProvider>
       </WalletProvider>
     </ConnectionProvider>
   );

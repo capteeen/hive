@@ -60,7 +60,85 @@ Each hour, after the hub takes 20%, the queen allocates the remaining 80%:
 
 No LLM is in the money path.
 
-## Phase 2 (TODO) — real chain
+## Multi-user, launches and the queen engine
+
+Everything below works out of the box in **mock mode** (the default): launches are simulated, but
+they are real records on the server, so every visitor sees every hive appear on the comb live.
+
+```
+npm run dev                 # mock mode, file store under .data/, live feed over SSE
+npm test                    # 188 unit/integration tests (vitest)
+bash scripts/test-sql.sh    # the Supabase schema on a throwaway Postgres 16 (93 assertions)
+```
+
+### How other users' hives reach you
+
+- The server stores hives, actions, harvests and prices behind one interface (`lib/server/db.ts`):
+  a JSON file store (`DATA_DIR`, default `.data`, `/tmp/hive-data` on Vercel) or Supabase.
+- Browsers load `/api/hives`, then listen for changes: Supabase Realtime when Supabase is configured,
+  otherwise Server-Sent Events from `/api/stream`. New hives play the founding animation for everyone.
+- Your own hives are the ones whose owner is your connected wallet (or, in mock mode without a
+  wallet, an anonymous id stored in your browser).
+
+**On Vercel you need Supabase for real multi-user.** Serverless instances do not share `/tmp`, so the
+file store is only for local development and single-server deployments. Setup:
+[`supabase/README.md`](supabase/README.md) (run `supabase/migrations/0001_hive.sql`, set the three
+Supabase env vars).
+
+### Launching
+
+The wizard (Queen look → Temperament → Rules → Coin → Dev buy + launch) calls:
+
+1. `POST /api/launch`: validates, reserves a free edge cell (the one you clicked, or the nearest free
+   one), generates the queen and mint keypairs (encrypted at rest), and returns the amount to pay.
+2. Live mode only: you sign a message proving the wallet is yours, then send one SOL transfer to your
+   queen's wallet.
+3. `POST /api/launch/[id]/confirm`: verifies the payment on chain, uploads the image and metadata to
+   IPFS (pump.fun), creates the coin through PumpPortal with the queen as creator (plus the optional
+   dev buy, whose tokens are sent to your wallet), and publishes the hive. Every step is idempotent and
+   resumable; closing the tab and coming back resumes the launch. Failed launches can be refunded.
+
+### The queen engine
+
+`/api/cron/hourly` runs every hive's queen (claim creator fees → 20% to the hub → seal / store /
+swarm by her rules) and then the harvest (the hub buys $HIVE, burns half, sends half to the biggest
+hive). `/api/cron/refresh` updates honey, bees and price. In mock mode a local server runs both on its
+own (`instrumentation.ts`; `ENGINE_AUTORUN=0` turns it off). In production, call them on a schedule:
+
+- **Vercel Pro**: add to `vercel.json`
+  `"crons": [{ "path": "/api/cron/hourly", "schedule": "0 * * * *" }, { "path": "/api/cron/refresh", "schedule": "2-59/5 * * * *" }]`.
+  Vercel Hobby only allows daily crons, so this is not in the repo by default.
+- **Anywhere else** (cron-job.org, GitHub Actions, a VPS): `GET /api/cron/hourly` and
+  `GET /api/cron/refresh` with `Authorization: Bearer $CRON_SECRET`.
+
+In live mode the engine only **records** what it would do (`dryRun`) until you set `ENGINE_DRY_RUN=0`.
+
+### Environment
+
+| variable | default | purpose |
+| --- | --- | --- |
+| `LAUNCH_MODE` | `mock` | `live` sends real transactions |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY` | unset | Supabase (required for live mode and for multi-user on Vercel) |
+| `SOLANA_RPC_URL` | public mainnet RPC | server RPC (use a paid one for live) |
+| `NEXT_PUBLIC_RPC` | public mainnet RPC | the wallet's RPC in the browser |
+| `QUEEN_KEY_SECRET` | dev key in `DATA_DIR` | 32-byte key (base64 or hex) that encrypts queen and mint keys; **required in live mode** |
+| `CRON_SECRET` | unset | bearer token for the cron routes (unset = only allowed in mock mode) |
+| `ENGINE_DRY_RUN` | `1` | live mode: record actions without sending |
+| `HUB_WALLET`, `HUB_WALLET_SECRET`, `HUB_TOKEN_MINT` | unset | the harvest wallet and the $HIVE mint |
+| `HELIUS_API_KEY` | unset | holder counts (bees) via Helius DAS |
+| `PRIORITY_FEE_SOL`, `SLIPPAGE_PCT` | `0.0005`, `10` | trade settings |
+| `NEXT_PUBLIC_DEMO_HIVES` | `1` | show the 60 simulated demo hives |
+| `DATA_DIR` | `.data` (`/tmp/hive-data` on Vercel) | file store location |
+
+### Before turning on live mode
+
+- Verify the PumpPortal request bodies (`lib/server/chain-live.ts`) and pump.fun's IPFS endpoint
+  against their current docs: this sandbox could not reach them, so they are tested against mocks only.
+- Fund nothing until a full launch has been run end to end on mainnet with a small dev buy.
+- `GET /api/config` shows the mode; `liveModeProblems()` refuses live launches until the required
+  env vars are set.
+
+## Phase 2 notes (historical)
 
 Everything below is stubbed or absent; the simulator is the only data source today.
 

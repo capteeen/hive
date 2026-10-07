@@ -81,6 +81,8 @@ export interface Harvest {
   jellyAmount: number; // hub tokens sent (as SOL value for display we keep both)
   jellySol: number;
   txSig: string;
+  /** Planned by the engine in dry-run mode: nothing was sent. */
+  dryRun?: boolean;
 }
 
 export interface Stats {

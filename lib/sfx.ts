@@ -5,7 +5,25 @@
  * (or ancestor) can pick another with `data-sfx="name"`, or opt out with `data-sfx="none"`.
  * Comb picks, wizard steps and launches call `sfx()` directly.
  */
-export type SfxName = 'click' | 'tick' | 'select' | 'empty' | 'deselect' | 'open' | 'close' | 'next' | 'back' | 'toggle' | 'shuffle' | 'swatch' | 'launch' | 'error';
+export type SfxName =
+  | 'click'
+  | 'tick'
+  | 'select'
+  | 'empty'
+  | 'deselect'
+  | 'open'
+  | 'close'
+  | 'next'
+  | 'back'
+  | 'toggle'
+  | 'shuffle'
+  | 'swatch'
+  | 'launch'
+  | 'error'
+  // ambient life (components/fx): a caught SOL coin, a caught bee, and the bee's buzz
+  | 'coin'
+  | 'catch'
+  | 'buzz';
 
 let ctx: AudioContext | null = null;
 let master: GainNode | null = null;
@@ -171,6 +189,20 @@ const SOUNDS: Record<SfxName, (ac: AudioContext) => void> = {
   error: (ac) => {
     tone(ac, { f0: 150, dur: 0.16, gain: 0.08, type: 'square', filter: { type: 'lowpass', freq: 900 } });
   },
+  // a SOL coin: a bright metallic clink, two quick high partials plus an inharmonic shimmer
+  coin: (ac) => {
+    noise(ac, 0, 0.012, 0.035, 6500);
+    tone(ac, { f0: 1975.53, dur: 0.07, gain: 0.08, type: 'triangle' });
+    tone(ac, { f0: 2637.02, at: 0.055, dur: 0.3, gain: 0.085, type: 'triangle' });
+    tone(ac, { f0: 6330, at: 0.055, dur: 0.12, gain: 0.018 });
+  },
+  // a caught bee: a playful upward chirp
+  catch: (ac) => {
+    tone(ac, { f0: 520, f1: 1480, dur: 0.13, gain: 0.12, type: 'triangle' });
+    tone(ac, { f0: 1046.5, f1: 2093, at: 0.1, dur: 0.11, gain: 0.07, type: 'triangle' });
+  },
+  // a short bee buzz flying off
+  buzz: (ac) => buzz(ac, 0, 0.38, 0.05, 220),
 };
 
 /** Play a UI sound (no-op when muted, on the server, or before audio is available). */
@@ -208,7 +240,7 @@ export function installClickSounds() {
     if (name === 'none') return;
     const target = el.closest<HTMLElement>('button, a[href], [role="button"], [role="tab"], input[type="checkbox"], input[type="radio"], select, summary, label');
     if (!target) return;
-    if ((target as HTMLButtonElement).disabled) {
+    if ((target as HTMLButtonElement).disabled || target.getAttribute('aria-disabled') === 'true') {
       sfx('error');
       return;
     }
@@ -221,9 +253,16 @@ export function installClickSounds() {
     const el = e.target as HTMLInputElement | null;
     if (el?.type === 'range') sfx('tick');
   };
+  // browsers dispatch no click on natively disabled buttons; catch the press instead
+  const onDown = (e: PointerEvent) => {
+    const el = e.target as HTMLElement | null;
+    if (el && typeof el.closest === 'function' && el.closest('button:disabled')) sfx('error');
+  };
+  document.addEventListener('pointerdown', onDown, true);
   document.addEventListener('click', onClick, true);
   document.addEventListener('input', onInput, true);
   return () => {
+    document.removeEventListener('pointerdown', onDown, true);
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('input', onInput, true);
   };

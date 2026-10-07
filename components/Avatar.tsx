@@ -22,7 +22,7 @@ export default function Avatar({ hive, size = 40, className = '' }: { hive: Pick
       {hive.image ? (
         <img src={hive.image} alt={hive.name} className={`h-full w-full object-cover ${grey ? 'grayscale' : ''}`} />
       ) : (
-        <span className="absolute inset-0 flex items-center justify-center font-heading font-semibold text-base" style={{ fontSize: size * 0.34, color: 'rgb(var(--c-base))' }}>
+        <span className="absolute inset-0 flex items-center justify-center font-heading font-semibold text-base" style={{ fontSize: size * 0.34, color: '#1C1409' }}>
           {hive.ticker.slice(0, 2)}
         </span>
       )}

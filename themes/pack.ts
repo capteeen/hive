@@ -69,6 +69,9 @@ export const pack: Theme = {
       sentence:
         'Paid to your den’s alpha wallet, which launches the coin as creator. From then on 80% of creator fees stay with the alpha to cull, cache and hunt, and 20% go to the hourly hunt.',
       reserveLabel: 'Alpha reserve',
+      namePlaceholder: 'Grey Ridge',
+      tickerPlaceholder: 'RIDGE',
+      mottoPlaceholder: 'Quiet paws, long winters.',
     },
     verbLabels: { burn: 'CULL', store: 'CACHE', interact: 'HUNT', starve: 'STARVE', abandon: 'ABANDON' },
     stats: { units: 'Dens', holders: 'Wolves', stored: 'Cached', burned: '$PACK burned', next: 'Next hunt' },

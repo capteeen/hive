@@ -5,7 +5,7 @@ import dynamic from 'next/dynamic';
 import { theme } from '@/themes';
 import { useHive } from '@/lib/store';
 import { useUI } from '@/lib/ui';
-import { installClickSounds } from '@/lib/sfx';
+import { installClickSounds, sfx } from '@/lib/sfx';
 import { useEffect } from 'react';
 import HexButton from './HexButton';
 import HarvestCountdown from './HarvestCountdown';
@@ -34,15 +34,32 @@ export default function Nav() {
   const openLaunch = useUI((s) => s.openLaunch);
   const fx = useHive((s) => s.sfx);
   const toggleSfx = useHive((s) => s.toggleSfx);
+  const preview = useHive((s) => s.config?.launchMode === 'mock');
+  const feed = useHive((s) => s.feed);
   useEffect(() => installClickSounds(), []);
   return (
     <>
       <header className="fixed inset-x-0 top-0 z-40 border-b border-accent/10 bg-night/60 backdrop-blur-xl">
         <div className="mx-auto flex h-16 max-w-[1400px] items-center gap-4 px-4 sm:px-6">
-          <Link href="/" className="flex items-center gap-2.5">
-            <span className="shape-hex inline-block h-7 w-7 bg-accent glow" />
-            <span className="font-heading text-lg font-semibold tracking-tight">{theme.name}</span>
-          </Link>
+          <div className="flex shrink-0 items-center gap-2.5">
+            <Link href="/" className="flex items-center gap-2.5">
+              <span className="shape-hex inline-block h-7 w-7 bg-accent glow" />
+              {/* the Preview chip sits under the name so the crowded header gains almost no width */}
+              <span className="flex flex-col items-start leading-none">
+                <span className="font-heading text-lg font-semibold leading-7 tracking-tight">{theme.name}</span>
+                {preview && (
+                  <span
+                    title="Preview mode: launches are simulated; nothing is sent on-chain."
+                    className="shape-btn -mt-0.5 inline-flex h-3.5 items-center bg-soft/15 !px-[9px] text-[8.5px] font-semibold uppercase tracking-wider text-soft"
+                    style={{ '--chamfer': '5px' } as React.CSSProperties}
+                  >
+                    Preview
+                  </span>
+                )}
+              </span>
+            </Link>
+            <FeedDot feed={feed} />
+          </div>
           <nav className="ml-6 hidden items-center gap-6 text-sm md:flex">
             {links.map((l) => (
               <Link key={l.href} href={l.href} className="navlink" aria-current={path === l.href || path.startsWith(l.href + '/') ? 'page' : undefined}>
@@ -61,11 +78,16 @@ export default function Nav() {
               <span className={`shape-hex inline-block h-2 w-2 ${sound ? 'bg-accent' : 'bg-text/30'}`} /> hum
             </button>
             <button
-              onClick={toggleSfx}
-              data-sfx="toggle"
+              onClick={() => {
+                // play while sounds are on: before muting, or right after unmuting
+                if (fx) sfx('toggle');
+                toggleSfx();
+                if (!fx) sfx('toggle');
+              }}
+              data-sfx="none"
               className="shape-btn btn-ghost inline-flex h-9 items-center text-xs"
               aria-pressed={fx}
-              aria-label={fx ? 'Click sounds on' : 'Click sounds off'}
+              aria-label="Click sounds"
               title={fx ? 'Click sounds on' : 'Click sounds off'}
             >
               <SpeakerIcon on={fx} />
@@ -102,6 +124,18 @@ export default function Nav() {
       <Hum />
     </>
   );
+}
+
+const FEED: Record<'connecting' | 'live' | 'offline', { label: string; cls: string }> = {
+  live: { label: `Live feed connected: new ${theme.unitPlural} and actions appear as they happen`, cls: 'bg-accent pulse-ring' },
+  connecting: { label: 'Live feed connecting…', cls: 'bg-text/30' },
+  offline: { label: 'Live feed offline: reconnecting', cls: 'bg-raid' },
+};
+
+/** Server feed status: accent pulse when live, muted while connecting, raid colour when offline. */
+function FeedDot({ feed }: { feed: 'connecting' | 'live' | 'offline' }) {
+  const f = FEED[feed];
+  return <span role="img" aria-label={f.label} title={f.label} className={`relative inline-block h-2 w-2 shrink-0 rounded-full transition-colors duration-600 ${f.cls}`} />;
 }
 
 function SpeakerIcon({ on }: { on: boolean }) {

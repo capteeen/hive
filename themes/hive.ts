@@ -73,6 +73,9 @@ export const hive: Theme = {
       sentence:
         'Paid to your hive’s queen wallet, which launches the coin as creator. From then on 80% of creator fees stay with the queen to seal, store and swarm, and 20% go to the hourly harvest.',
       reserveLabel: 'Queen reserve',
+      namePlaceholder: 'Amber Comb',
+      tickerPlaceholder: 'AMBER',
+      mottoPlaceholder: 'Slow honey, sharp sting.',
     },
     verbLabels: { burn: 'SEAL', store: 'STORE', interact: 'SWARM', starve: 'STARVE', abandon: 'ABANDON' },
     stats: { units: 'Hives', holders: 'Bees', stored: 'Honey stored', burned: '$HIVE burned', next: 'Next harvest' },

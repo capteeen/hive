@@ -29,7 +29,8 @@ export const config = {
     serviceKey: env('SUPABASE_SERVICE_ROLE_KEY'),
   },
   /** File store location when Supabase is not configured. */
-  dataDir: env('DATA_DIR') ?? '.data',
+  // Vercel's filesystem is read-only except /tmp (and /tmp is per instance: use Supabase for real multi-user)
+  dataDir: env('DATA_DIR') ?? (process.env.VERCEL ? '/tmp/hive-data' : '.data'),
   rpcUrl: env('SOLANA_RPC_URL') ?? 'https://api.mainnet-beta.solana.com',
   /** 32-byte key (base64 or hex) that encrypts queen secret keys at rest. */
   queenKeySecret: env('QUEEN_KEY_SECRET'),
@@ -59,6 +60,7 @@ export function liveModeProblems(): string[] {
   if (!config.queenKeySecret) p.push('QUEEN_KEY_SECRET is not set.');
   if (!process.env.SOLANA_RPC_URL) p.push('SOLANA_RPC_URL is not set (use a paid RPC for mainnet).');
   if (!hasSupabase()) p.push('Supabase is not configured: live mode needs a durable database, not the local file store.');
+  else if (!config.supabase.anonKey) p.push('NEXT_PUBLIC_SUPABASE_ANON_KEY is not set: browsers need it to see other users\' hives in realtime.');
   return p;
 }
 

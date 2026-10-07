@@ -1,10 +1,12 @@
 'use client';
 /* eslint-disable @next/next/no-img-element -- data-URL previews, not optimisable */
 import dynamic from 'next/dynamic';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { isValidElement, useEffect, useMemo, useRef, useState } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
-import { useWallet } from '@solana/wallet-adapter-react';
+import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { useWalletModal } from '@solana/wallet-adapter-react-ui';
+import { PublicKey, SystemProgram, Transaction } from '@solana/web3.js';
+import bs58 from 'bs58';
 import { useUI } from '@/lib/ui';
 import { useHive } from '@/lib/store';
 import { LAUNCH_COST, QUEEN_RESERVE, isFoundable } from '@/lib/sim';
@@ -12,6 +14,30 @@ import { cellKey, hexDistance, neighbors } from '@/lib/hex';
 import { theme } from '@/themes';
 import { sfx } from '@/lib/sfx';
 import { short } from '@/lib/format';
+import { guestId } from '@/lib/guest';
+import { downscaleImage } from '@/lib/imageResize';
+import { launchMessage, type LaunchPayload, type LaunchPrepareResponse, type LaunchStatusResponse, type PublicConfig } from '@/lib/shared/api';
+import {
+  BASE_FEE_LAMPORTS,
+  LaunchApiError,
+  awaitingPayment,
+  checkBeforeForget,
+  clearPending,
+  confirmLaunch,
+  getConfig,
+  isTerminal,
+  loadPending,
+  needsAction,
+  paymentUnheard,
+  pollLaunch,
+  prepareLaunch,
+  refundLaunch,
+  refundMessage,
+  resumeLaunch,
+  savePending,
+  type PendingLaunch,
+} from '@/lib/launchClient';
+import LaunchProgress, { type LaunchPhase } from './LaunchProgress';
 import {
   CROWNS,
   DEFAULT_LOOK,
@@ -37,6 +63,8 @@ import {
 } from '@/lib/queen';
 
 const QueenPreview = dynamic(() => import('./QueenPreview'), { ssr: false });
+/** Icon glyphs that follow the theme's shape language. */
+const GLYPH = theme.shape === 'hex' ? { outline: '⬡', solid: '⬢' } : { outline: '○', solid: '●' };
 
 const cap = (s: string) => s[0].toUpperCase() + s.slice(1);
 const pct = (n: number) => `${Math.round(n * 100)}%`;
@@ -104,6 +132,29 @@ function loadDraft(): Draft {
 
 const STEPS = [`${cap(theme.agent)}`, 'Temperament', 'Rules', 'Coin', 'Dev buy + launch'];
 
+/** A launch in progress (server-side), shown by LaunchProgress instead of the form. */
+interface Run {
+  phase: LaunchPhase;
+  pending: PendingLaunch | null;
+  status: LaunchStatusResponse | null;
+  /** Problem on this side (wallet declined, network). */
+  error?: string;
+  /** Offer the Pay button (live, reserved, nothing paid). */
+  canPay?: boolean;
+  /** Picked up from a previous visit: on success show "Go to my hive" instead of navigating away. */
+  resumed?: boolean;
+  /** Expired with no payment on record, yet the queen wallet holds SOL (a payment whose signature was lost): offer Refund. */
+  stranded?: boolean;
+}
+
+/** Human message for wallet / API / other errors. */
+function friendly(e: unknown): string {
+  if (e instanceof LaunchApiError) return e.reasons && e.reasons.length > 1 ? `${e.message} ${e.reasons.slice(1).join(' ')}` : e.message;
+  const m = e instanceof Error ? e.message : String(e);
+  if (/reject|denied|declin|cancel/i.test(m) || (e instanceof Error && /WalletSign|WalletSend/.test(e.name) && !m)) return 'You declined in your wallet. Nothing was sent.';
+  return m || 'Something went wrong.';
+}
+
 export default function LaunchWizard() {
   const open = useUI((s) => s.launchOpen);
   const close = useUI((s) => s.closeLaunch);
@@ -114,16 +165,57 @@ export default function LaunchWizard() {
   useHive((s) => s.version);
   const router = useRouter();
   const pathname = usePathname();
-  const { publicKey, signMessage } = useWallet();
+  const { publicKey, signMessage, sendTransaction } = useWallet();
+  const { connection } = useConnection();
   const { setVisible } = useWalletModal();
+  const storeConfig = useHive((s) => s.config);
+  const markMine = useHive((s) => s.markMine);
   const [d, setD] = useState<Draft>(EMPTY);
   const [loaded, setLoaded] = useState(false);
+  // one live 3D preview at a time: inline on phones, in the side column on wide screens
+  const [wideLayout, setWideLayout] = useState(false);
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1024px)');
+    const on = () => setWideLayout(mq.matches);
+    on();
+    mq.addEventListener('change', on);
+    return () => mq.removeEventListener('change', on);
+  }, []);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [agreed, setAgreed] = useState(false);
+  const [fetchedConfig, setFetchedConfig] = useState<PublicConfig | null>(null);
+  const [configFailed, setConfigFailed] = useState(false);
+  const [run, setRun] = useState<Run | null>(null);
+  /** Founded in this browser only because the server was unreachable. */
+  const [localOnly, setLocalOnly] = useState<{ ca: string } | null>(null);
+  const pollAbort = useRef<AbortController | null>(null);
+  /** A resume of a saved launch is running. A ref, not effect state: it outlives closing the wizard (which stays mounted). */
+  const resuming = useRef(false);
   const fileRef = useRef<HTMLInputElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
+  const serverConfig = storeConfig ?? fetchedConfig;
+  const isLive = serverConfig?.launchMode === 'live';
+  // the server's numbers; the simulator constants only until the config arrives
+  const costs = serverConfig?.costs ?? { launchCost: LAUNCH_COST, queenReserve: QUEEN_RESERVE, maxDevBuy: MAX_DEV };
+  const maxDev = costs.maxDevBuy;
+  const configLoading = !serverConfig && !configFailed;
+
+  // server config (launch mode + costs), unless the app already loaded it
+  useEffect(() => {
+    if (!open || storeConfig || fetchedConfig) return;
+    let live = true;
+    getConfig()
+      .then((c) => live && (setFetchedConfig(c), setConfigFailed(false)))
+      .catch(() => live && setConfigFailed(true));
+    return () => {
+      live = false;
+    };
+  }, [open, storeConfig, fetchedConfig]);
+
+  // stop polling when the wizard unmounts
+  useEffect(() => () => pollAbort.current?.abort(), []);
 
   // restore the saved design once, client-side
   useEffect(() => {
@@ -138,7 +230,8 @@ export default function LaunchWizard() {
         localStorage.setItem(DRAFT_KEY, JSON.stringify(d));
       } catch {
         try {
-          localStorage.setItem(DRAFT_KEY, JSON.stringify({ ...d, upload: '' })); // too big: keep everything but the upload
+          // too big: keep everything but the upload, and fall back to the drawn queen so the toggle matches
+          localStorage.setItem(DRAFT_KEY, JSON.stringify({ ...d, upload: '', imageMode: 'queen' }));
         } catch {}
       }
     }, 250);
@@ -172,11 +265,11 @@ export default function LaunchWizard() {
   const lookKey = JSON.stringify(d.look);
   const queenImg = useMemo(() => (typeof document !== 'undefined' && open ? drawQueenImage(d.look, 384) : ''), [lookKey, open]); // eslint-disable-line react-hooks/exhaustive-deps
   const image = d.imageMode === 'upload' && d.upload ? d.upload : queenImg;
-  const dev = Math.min(MAX_DEV, Math.max(0, parseFloat(d.devBuy) || 0));
-  const total = LAUNCH_COST + QUEEN_RESERVE + dev;
+  const dev = Math.min(maxDev, Math.max(0, parseFloat(d.devBuy) || 0));
+  const total = costs.launchCost + costs.queenReserve + dev;
   const nameOk = d.name.trim().length >= 2 && d.name.trim().length <= 32;
   const tickerOk = /^[A-Za-z0-9]{2,8}$/.test(d.ticker.trim());
-  const devOk = d.devBuy.trim() === '' || (/^\d*\.?\d*$/.test(d.devBuy.trim()) && parseFloat(d.devBuy) <= MAX_DEV);
+  const devOk = d.devBuy.trim() === '' || (/^\d*\.?\d*$/.test(d.devBuy.trim()) && parseFloat(d.devBuy) <= maxDev);
   const coinOk = nameOk && tickerOk;
   const dipName = DIPS.find((x) => x.id === d.dip)?.name ?? '';
   const swarmName = d.swarm === 'custom' ? 'Custom' : SWARMS.find((x) => x.id === d.swarm)?.name ?? '';
@@ -189,6 +282,233 @@ export default function LaunchWizard() {
       .map((c) => occ.get(cellKey(c)))
       .filter(Boolean) as string[];
   }, [launchCell, world, world.order.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  /* ---------- the server launch flow ---------- */
+
+  // stay and watch the founding on a page that shows the comb; otherwise go to it
+  const goToHive = (ca: string) => {
+    if (pathname === '/') window.scrollTo({ top: 0, behavior: 'smooth' });
+    else if (pathname !== '/comb') router.push(`/comb?focus=${ca}`);
+  };
+
+  const clearDraft = () => {
+    try {
+      localStorage.removeItem(DRAFT_KEY);
+    } catch {}
+    setD(EMPTY);
+    setAgreed(false);
+  };
+
+  const showStatus = (s: LaunchStatusResponse) => setRun((r) => (r ? { ...r, status: s, error: undefined } : r));
+
+  /** The hive is live: put it on the comb right away (the feed would bring it a moment later). */
+  const finish = (s: LaunchStatusResponse, resumed: boolean) => {
+    const ca = s.ca ?? s.hive?.ca;
+    clearPending();
+    if (!ca) return;
+    if (s.hive) useHive.getState().applyRemote({ hives: [s.hive] });
+    markMine(ca);
+    sfx('launch');
+    clearDraft();
+    if (resumed) {
+      setRun((r) => (r ? { ...r, phase: 'done', status: s, error: undefined, canPay: false } : r));
+      return;
+    }
+    setRun(null);
+    if (!useUI.getState().launchOpen) return; // closed meanwhile: do not yank the page away
+    close();
+    goToHive(ca);
+  };
+
+  /** A payment that is neither on chain nor able to land any more (its blockhash expired). */
+  const paymentDropped = async (p: PendingLaunch) => {
+    if (!p.paySig || !p.payBlockhash) return false;
+    try {
+      const st = (await connection.getSignatureStatuses([p.paySig], { searchTransactionHistory: true })).value[0];
+      if (st) return false;
+      return !(await connection.isBlockhashValid(p.payBlockhash, { commitment: 'processed' })).value;
+    } catch {
+      return false;
+    }
+  };
+
+  /** One plain SOL transfer from the owner to the queen wallet, via the wallet adapter. */
+  const pay = async (p: PendingLaunch): Promise<PendingLaunch> => {
+    if (!publicKey || !sendTransaction) throw new Error('Connect the wallet that started this launch.');
+    if (publicKey.toBase58() !== p.owner) throw new Error(`Switch to wallet ${short(p.owner)} to pay for this launch.`);
+    setRun((r) => (r ? { ...r, phase: 'pay', error: undefined, canPay: false } : r));
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    const tx = new Transaction({ feePayer: publicKey, blockhash, lastValidBlockHeight }).add(
+      SystemProgram.transfer({ fromPubkey: publicKey, toPubkey: new PublicKey(p.queenWallet), lamports: p.lamports }),
+    );
+    const sig = await sendTransaction(tx, connection);
+    const next = { ...p, paySig: sig, payBlockhash: blockhash };
+    savePending(next);
+    setRun((r) => (r ? { ...r, pending: next } : r));
+    return next;
+  };
+
+  /**
+   * An expired live launch with no payment on record: look at the queen wallet anyway. SOL there means
+   * a payment whose signature never reached the server (the server refunds the balance in that case).
+   */
+  const checkStranded = async (s: LaunchStatusResponse) => {
+    if (s.mode !== 'live' || s.state !== 'expired' || s.txs.payment) return;
+    try {
+      const lamports = await connection.getBalance(new PublicKey(s.queenWallet), 'confirmed');
+      if (lamports > BASE_FEE_LAMPORTS) {
+        setRun((r) => (r ? { ...r, stranded: true, error: `SOL arrived in your ${theme.agent} wallet after the reservation expired. Refund it before starting over.` } : r));
+      }
+    } catch {
+      /* RPC unreachable: the server still refunds it if asked */
+    }
+  };
+
+  /**
+   * Confirm (the server advances as far as it can), then follow it until it is live or needs the user.
+   * `first`: a confirm answer the caller already has (resume), so it is not sent twice.
+   */
+  const drive = async (p: PendingLaunch, resumed = false, first?: LaunchStatusResponse) => {
+    setRun((r) => ({ ...(r ?? { pending: p, status: null }), pending: p, phase: 'confirm', error: undefined, canPay: false, resumed: r?.resumed ?? resumed }));
+    pollAbort.current?.abort();
+    const ac = new AbortController();
+    pollAbort.current = ac;
+    let s = first ?? (await confirmLaunch(p.id, p.paySig));
+    showStatus(s);
+    if (!needsAction(s)) s = (await pollLaunch(p.id, { onUpdate: showStatus, signal: ac.signal, initial: s })) ?? s;
+    if (ac.signal.aborted) return;
+    if (s.state === 'live') return finish(s, resumed);
+    if (s.state === 'reserved' && p.mode === 'live') {
+      if (awaitingPayment(s) && (await paymentDropped(p))) {
+        const fresh = { ...p, paySig: undefined, payBlockhash: undefined };
+        savePending(fresh);
+        setRun((r) => (r ? { ...r, pending: fresh, canPay: true, error: 'Your payment never landed, so nothing was taken. Pay again.' } : r));
+      } else if (!s.txs.payment) {
+        setRun((r) => (r ? { ...r, canPay: true } : r));
+      }
+    }
+    if (s.error && !awaitingPayment(s)) sfx('error');
+    await checkStranded(s);
+  };
+
+  const fail = (e: unknown, canPay = false) => {
+    sfx('error');
+    setRun((r) => (r ? { ...r, error: friendly(e), canPay: canPay || r.canPay } : r));
+  };
+
+  const retry = async () => {
+    const p = run?.pending ?? loadPending();
+    if (!p || busy) return;
+    setBusy(true);
+    try {
+      await drive(p, run?.resumed);
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const payAgain = async () => {
+    const p = run?.pending ?? loadPending();
+    if (!p || busy) return;
+    if (!publicKey) return setVisible(true);
+    setBusy(true);
+    try {
+      await drive(await pay(p), run?.resumed);
+    } catch (e) {
+      fail(e, true);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const refund = async () => {
+    const id = run?.pending?.id ?? run?.status?.launchId;
+    if (!id || busy) return;
+    const live = (run?.status?.mode ?? run?.pending?.mode) === 'live';
+    if (live && (!publicKey || !signMessage)) return setVisible(true);
+    setBusy(true);
+    try {
+      const sig = live ? bs58.encode(await signMessage!(new TextEncoder().encode(refundMessage(id)))) : undefined;
+      showStatus(await refundLaunch(id, sig));
+      clearPending();
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /** Drop the launch from this browser and go back to the form. */
+  const forget = () => {
+    pollAbort.current?.abort();
+    clearPending();
+    setRun(null);
+    setErr('');
+  };
+
+  /**
+   * Cancel / Start over / Launch another. A payment signature the server has not recorded is never
+   * thrown away unheard: it is handed over first, and the launch is kept when it turns out to matter.
+   */
+  const dismiss = async () => {
+    const p = run?.pending;
+    if (!paymentUnheard(p, run?.status)) return forget();
+    if (busy) return;
+    setBusy(true);
+    try {
+      const res = await checkBeforeForget(p, run?.status);
+      if (res.forget) return forget();
+      const s = res.status;
+      if (s.state === 'live') return finish(s, true);
+      showStatus(s);
+      if (s.state !== 'refunded') {
+        const next = isTerminal(s.state) ? 'Refund it to get your SOL back.' : 'Retry to finish it.';
+        setRun((r) => (r ? { ...r, error: `Your payment reached the server, so this launch was not cancelled. ${next}` } : r));
+      }
+    } catch (e) {
+      fail(e);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  // A launch started earlier in this browser: show where it is and carry on.
+  useEffect(() => {
+    if (!open || run || busy || resuming.current) return;
+    const p = loadPending();
+    if (!p) return;
+    resuming.current = true;
+    setBusy(true);
+    setRun({ phase: 'confirm', pending: p, status: null, resumed: true });
+    (async () => {
+      try {
+        // With a saved payment signature this is a confirm that hands it over, not just a status read.
+        const s = await resumeLaunch(p);
+        showStatus(s);
+        if (s.state === 'live') return finish(s, true);
+        if (isTerminal(s.state)) return await checkStranded(s);
+        if (s.state === 'reserved' && !s.txs.payment && !p.paySig && p.mode === 'live') {
+          // No signature saved, but the page may have reloaded after the wallet sent the payment:
+          // warn before a second payment (an unclaimed one is refundable once the reservation expires).
+          const held = await connection.getBalance(new PublicKey(p.queenWallet), 'confirmed').catch(() => 0);
+          const warn = held >= p.lamports ? `Your ${theme.agent} wallet already holds ${(held / 1e9).toFixed(4)} SOL, so an earlier payment may have gone through. Check your wallet before paying again; if you did pay, refund it once the reservation expires.` : undefined;
+          setRun((r) => (r ? { ...r, phase: 'pay', canPay: true, error: warn } : r));
+          return;
+        }
+        await drive(p, true, p.paySig ? s : undefined);
+      } catch (e) {
+        // The server has never heard of it (and was reachable): nothing to resume.
+        if (e instanceof LaunchApiError && e.status === 404 && !e.network && !p.paySig) return forget();
+        fail(e);
+      } finally {
+        resuming.current = false;
+        // Always: closing the wizard does not unmount it, so nothing else would ever clear `busy`.
+        setBusy(false);
+      }
+    })();
+  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
 
   if (!open) return null;
 
@@ -206,7 +526,17 @@ export default function LaunchWizard() {
     if (!f.type.startsWith('image/')) return setErr('That file is not an image.');
     if (f.size > MAX_UPLOAD) return setErr('Images up to 4 MB, please.');
     const r = new FileReader();
-    r.onload = () => up({ upload: String(r.result), imageMode: 'upload' });
+    r.onload = async () => {
+      // shrink right away: the draft lives in localStorage and the server takes ≤ 400 KB anyway
+      let url = String(r.result);
+      try {
+        url = await downscaleImage(url, { maxSide: 512 });
+      } catch {
+        /* keep the original; launch downscales again */
+      }
+      setErr('');
+      up({ upload: url, imageMode: 'upload' });
+    };
     r.readAsDataURL(f);
   };
 
@@ -219,60 +549,106 @@ export default function LaunchWizard() {
     }
     if (!devOk) {
       sfx('error');
-      setErr(`Dev buy must be between 0 and ${MAX_DEV} SOL.`);
+      setErr(`Dev buy must be between 0 and ${maxDev} SOL.`);
       return;
     }
     if (!agreed) {
       sfx('error');
-      setErr('Tick the box to confirm your queen acts on her own.');
+      setErr(`Tick the box to confirm your ${theme.agent} acts on her own.`);
       return;
     }
-    if (!publicKey) {
+    if (isLive && !publicKey) {
       setVisible(true);
+      return;
+    }
+    if (isLive && !signMessage) {
+      sfx('error');
+      setErr('This wallet cannot sign messages. Try Phantom, Solflare or Backpack.');
       return;
     }
     setBusy(true);
     setErr('');
+    setLocalOnly(null);
+    let pending: PendingLaunch | null = null;
     try {
-      // Phase 1: mock. Phase 2 (TODO): POST /api/launch → server creates the queen keypair, the user pays
-      // `total` to it, the server launches via PumpPortal with the queen as creator and stores look + rules.
-      if (signMessage) {
-        try {
-          await signMessage(new TextEncoder().encode(`${theme.name}: found "${d.name.trim()}" ($${d.ticker.trim().toUpperCase()}). Mock launch, nothing is sent.`));
-        } catch {
-          /* declining the signature is fine in the mock */
-        }
-      }
-      await new Promise((r) => setTimeout(r, 700));
-      const target = launchCell && isFoundable(useHive.getState().world, launchCell) ? launchCell : null;
-      const h = found({
+      const img = await downscaleImage(image);
+      // mock mode lets you launch without a wallet; live mode always has one by now
+      const owner = publicKey ? publicKey.toBase58() : guestId();
+      const payload: LaunchPayload = {
+        owner,
         name: d.name.trim(),
-        ticker: d.ticker.trim(),
-        image,
-        description: d.desc,
+        ticker: d.ticker.trim().toUpperCase(),
+        description: d.desc.trim() || undefined,
+        motto: d.motto.trim() || undefined,
+        telegram: d.tg.trim() || undefined,
+        twitter: d.x.trim() || undefined,
+        image: img,
         devBuy: dev,
-        cell: target,
+        cell: launchCell,
         look: d.look,
         rules,
-        motto: d.motto,
         temperament: { dip: dipName, swarm: swarmName },
-      });
-      sfx('launch');
+        issuedAt: Date.now(),
+      };
+      let signature: string | undefined;
+      if (isLive) {
+        setRun({ phase: 'sign', pending: null, status: null });
+        signature = bs58.encode(await signMessage!(new TextEncoder().encode(launchMessage(payload))));
+      }
+      setRun({ phase: 'prepare', pending: null, status: null });
+      let prep: LaunchPrepareResponse;
       try {
-        localStorage.removeItem(DRAFT_KEY);
-      } catch {}
-      setD(EMPTY);
-      setAgreed(false);
-      close();
-      // stay and watch the founding on a page that shows the comb; otherwise go to it
-      if (pathname === '/') window.scrollTo({ top: 0, behavior: 'smooth' });
-      else if (pathname !== '/comb') router.push(`/comb?focus=${h.ca}`);
+        prep = await prepareLaunch(payload, signature);
+      } catch (e) {
+        if (e instanceof LaunchApiError && e.network) return foundLocally(img);
+        throw e;
+      }
+      pending = {
+        id: prep.launchId,
+        mode: prep.mode,
+        owner,
+        queenWallet: prep.queenWallet,
+        lamports: prep.lamports,
+        cell: prep.cell,
+        cellChanged: prep.cellChanged,
+        expiresAt: prep.expiresAt,
+        startedAt: Date.now(),
+      };
+      savePending(pending);
+      setRun({ phase: prep.mode === 'live' ? 'pay' : 'confirm', pending, status: null });
+      if (prep.mode === 'live') pending = await pay(pending);
+      await drive(pending);
     } catch (e) {
-      sfx('error');
-      setErr((e as Error).message ?? 'Launch failed');
+      if (!pending) {
+        // nothing was reserved: back to the form
+        sfx('error');
+        setRun(null);
+        setErr(friendly(e));
+      } else fail(e, !pending.paySig && pending.mode === 'live');
     } finally {
       setBusy(false);
     }
+  };
+
+  /** The server could not be reached: found the hive in this browser only (the old preview path). */
+  const foundLocally = (img: string) => {
+    const target = launchCell && isFoundable(useHive.getState().world, launchCell) ? launchCell : null;
+    const h = found({
+      name: d.name.trim(),
+      ticker: d.ticker.trim(),
+      image: img,
+      description: d.desc,
+      devBuy: dev,
+      cell: target,
+      look: d.look,
+      rules,
+      motto: d.motto,
+      temperament: { dip: dipName, swarm: swarmName },
+    });
+    sfx('launch');
+    clearDraft();
+    setRun(null);
+    setLocalOnly({ ca: h.ca });
   };
 
   const bubble =
@@ -283,7 +659,7 @@ export default function LaunchWizard() {
           ? 'Neighbours, run.'
           : d.dip === 'fierce'
             ? 'Dips make me burn.'
-            : 'I keep the comb full.'
+            : `I keep the ${theme.scene} full.`
         : d.step === 2
           ? 'Every number is public.'
           : d.step === 3
@@ -328,9 +704,9 @@ export default function LaunchWizard() {
                 onClick={() => go(i)}
                 data-sfx="none"
                 className={`flex min-w-[150px] flex-1 items-center gap-3 border px-3 py-2.5 text-left font-heading text-sm font-semibold tracking-tight transition-colors duration-600 ${cur ? 'border-accent bg-accent/10 text-text' : 'border-text/10 bg-night/40 text-text/75 hover:border-accent/40'}`}
-                style={{ clipPath: 'polygon(8px 0, calc(100% - 8px) 0, 100% 8px, 100% calc(100% - 8px), calc(100% - 8px) 100%, 8px 100%, 0 calc(100% - 8px), 0 8px)' }}
+                data-cut="8"
               >
-                <span className={`shape-hex flex h-7 w-7 shrink-0 items-center justify-center text-xs ${cur ? 'bg-accent text-night' : done ? 'bg-soft/80 text-night' : 'bg-text/10 text-text/60'}`}>{done ? '✓' : i + 1}</span>
+                <span className={`shape-hex flex h-7 w-7 shrink-0 items-center justify-center text-xs ${cur ? 'bg-accent text-[#1C1409]' : done ? 'bg-soft/80 text-[#1C1409]' : 'bg-text/10 text-text/60'}`}>{done ? '✓' : i + 1}</span>
                 {label}
               </button>
             );
@@ -338,14 +714,14 @@ export default function LaunchWizard() {
         </div>
         {/* banners */}
         <div className="border-b border-accent/10 bg-accent/[0.04] px-4 py-2 text-xs leading-relaxed sm:px-6 sm:text-[13px]">
-          <span className="font-semibold text-soft">✓ No wallet needed to build it.</span> <span className="text-text/70">You connect only at the last step. Your design is saved in this browser.</span>
+          <span className="font-semibold text-accent">✓ No wallet needed to build it.</span> <span className="text-text/70">You connect only at the last step. Your design is saved in this browser.</span>
         </div>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-1 border-b border-accent/10 bg-accent/[0.04] px-4 py-2 text-xs leading-relaxed sm:px-6 sm:text-[13px]">
           <span className="shape-hex inline-block h-3 w-3 bg-accent" />
           {launchCell ? (
             cellFree ? (
               <>
-                <span className="font-semibold text-soft">
+                <span className="font-semibold text-accent">
                   Your cell: ring {ring}, the empty cell you clicked.
                 </span>
                 <span className="text-text/70">
@@ -357,7 +733,7 @@ export default function LaunchWizard() {
             )
           ) : (
             <>
-              <span className="font-semibold text-soft">Your cell: the next free cell on the edge of the {theme.scene}.</span>
+              <span className="font-semibold text-accent">Your cell: the next free cell on the edge of the {theme.scene}.</span>
               <span className="text-text/70">To choose your spot, close this and click an empty + cell on the {theme.scene}.</span>
             </>
           )}
@@ -371,10 +747,53 @@ export default function LaunchWizard() {
         {/* body */}
         <div className="grid min-h-0 flex-1 lg:grid-cols-[minmax(0,1fr)_460px]">
           <div ref={bodyRef} className="scroll-thin min-h-0 overflow-y-auto px-4 py-5 sm:px-6">
+            {localOnly ? (
+              <section>
+                <StepTitle icon={GLYPH.solid} title={`Founded in this browser only`} />
+                <p className="mt-3 border border-raid/40 bg-raid/[0.07] p-4 text-sm leading-relaxed" role="alert">
+                  The {theme.name} server could not be reached, so your {theme.unit} was founded locally as a preview. Nobody else can see it, nothing was sent, and it disappears when you reload.
+                </p>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <button
+                    onClick={() => {
+                      const ca = localOnly.ca;
+                      setLocalOnly(null);
+                      close();
+                      goToHive(ca);
+                    }}
+                    className="shape-btn btn-honey h-10 font-heading text-sm font-semibold"
+                  >
+                    See it on the {theme.scene}
+                  </button>
+                </div>
+              </section>
+            ) : run ? (
+              <LaunchProgress
+                mode={run.status?.mode ?? run.pending?.mode ?? (isLive ? 'live' : 'mock')}
+                phase={run.phase}
+                status={run.status}
+                reservation={run.pending}
+                error={run.error}
+                busy={busy}
+                canPay={run.canPay}
+                onPay={payAgain}
+                onRetry={retry}
+                onRefund={refund}
+                onDismiss={dismiss}
+                stranded={run.stranded}
+                onOpenHive={() => {
+                  const ca = run.status?.ca;
+                  forget();
+                  close();
+                  if (ca) goToHive(ca);
+                }}
+              />
+            ) : (
+            <>
             {d.step === 0 && (
               <section>
-                <div className="mb-4 lg:hidden">
-                  <QueenPreview look={d.look} speaking={bubble} className="h-56 border border-text/10" />
+                <div className={wideLayout ? "hidden" : "mb-4"}>
+                  {!wideLayout && <QueenPreview look={d.look} speaking={bubble} className="h-56 border border-text/10" />}
                 </div>
                 <div className="flex items-start justify-between gap-4">
                   <StepTitle icon="♛" title={`${cap(theme.agent)} look`} />
@@ -422,7 +841,7 @@ export default function LaunchWizard() {
                   ))}
                 </div>
                 <div className="mt-7 flex items-baseline gap-3">
-                  <StepTitle icon="⬡" title={`How she ${theme.verbs.interact}s`} sub={`${theme.verbs.interact}s buy the nearest ${theme.unit} with the fastest fee growth`} />
+                  <StepTitle icon={GLYPH.outline} title={`How she ${theme.verbs.interact}s`} sub={`${theme.verbs.interact}s buy the nearest ${theme.unit} with the fastest fee growth`} />
                 </div>
                 <div className="mt-4 grid gap-3 md:grid-cols-2">
                   {SWARMS.map((x) => (
@@ -430,7 +849,7 @@ export default function LaunchWizard() {
                       key={x.id}
                       active={d.swarm === x.id}
                       onClick={() => up({ swarm: x.id })}
-                      icon="⬢"
+                      icon={GLYPH.solid}
                       title={x.name}
                       risk={x.risk}
                       body={x.body}
@@ -506,16 +925,16 @@ export default function LaunchWizard() {
                 <div>
                   <StepTitle icon="◎" title="Its coin" sub={`launched on pump.fun by your ${theme.agent}'s own wallet`} />
                   <Field label="Name">
-                    <input value={d.name} onChange={(e) => up({ name: e.target.value })} maxLength={32} placeholder="Amber Comb" className="inp" aria-invalid={!!d.name && !nameOk} />
+                    <input value={d.name} onChange={(e) => up({ name: e.target.value })} maxLength={32} placeholder={theme.copy.launch.namePlaceholder} className="inp" aria-invalid={!!d.name && !nameOk} />
                   </Field>
                   <Field label="Ticker">
-                    <input value={d.ticker} onChange={(e) => up({ ticker: e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '') })} maxLength={8} placeholder="AMBER" className="inp uppercase" aria-invalid={!!d.ticker && !tickerOk} />
+                    <input value={d.ticker} onChange={(e) => up({ ticker: e.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '') })} maxLength={8} placeholder={theme.copy.launch.tickerPlaceholder} className="inp uppercase" aria-invalid={!!d.ticker && !tickerOk} />
                   </Field>
                   <Field label="Description" hint="optional, shown on pump.fun">
                     <textarea value={d.desc} onChange={(e) => up({ desc: e.target.value })} rows={3} maxLength={280} placeholder={`A patient ${theme.agent} on the ${theme.scene}.`} className="inp resize-none" />
                   </Field>
                   <Field label="Motto" hint={`one line, how your ${theme.agent} talks`}>
-                    <input value={d.motto} onChange={(e) => up({ motto: e.target.value })} maxLength={80} placeholder="Slow honey, sharp sting." className="inp" />
+                    <input value={d.motto} onChange={(e) => up({ motto: e.target.value })} maxLength={80} placeholder={theme.copy.launch.mottoPlaceholder} className="inp" />
                   </Field>
                   <div className="grid gap-3 sm:grid-cols-2">
                     <Field label="Telegram" hint="optional">
@@ -554,7 +973,15 @@ export default function LaunchWizard() {
 
             {d.step === 4 && (
               <section>
-                <StepTitle icon="◈" title="Dev buy" sub={`optional, 0 to ${MAX_DEV} SOL`} />
+                {!isLive && (
+                  <div className="mb-5 border border-accent/40 bg-accent/[0.07] p-4 text-sm leading-relaxed">
+                    <b className="font-heading text-accent">Preview mode.</b>{' '}
+                    {configFailed
+                      ? `The ${theme.name} server cannot be reached right now: launching founds your ${theme.unit} in this browser only.`
+                      : `Launches on this server are simulated: no coin is created and no SOL moves. Your ${theme.unit} is still shared with everyone on this server, on the same ${theme.scene}.`}
+                  </div>
+                )}
+                <StepTitle icon="◈" title="Dev buy" sub={`optional, 0 to ${maxDev} SOL`} />
                 <div className="mt-3 flex flex-wrap items-center gap-2">
                   {DEV_PRESETS.map((v) => (
                     <button
@@ -562,27 +989,35 @@ export default function LaunchWizard() {
                       onClick={() => up({ devBuy: String(v) })}
                       aria-pressed={dev === v && d.devBuy !== ''}
                       className={`border px-3 py-2 text-sm font-semibold tabular-nums transition-colors duration-600 ${dev === v ? 'border-accent bg-accent/10 text-accent' : 'border-text/15 text-text/75 hover:border-accent/40'}`}
-                      style={{ clipPath: 'polygon(6px 0, calc(100% - 6px) 0, 100% 6px, 100% calc(100% - 6px), calc(100% - 6px) 100%, 6px 100%, 0 calc(100% - 6px), 0 6px)' }}
+                      data-cut="6"
                     >
                       {v} SOL
                     </button>
                   ))}
-                  <label className="flex items-center gap-2 border border-text/15 px-3 py-1.5" style={{ clipPath: 'polygon(6px 0, calc(100% - 6px) 0, 100% 6px, 100% calc(100% - 6px), calc(100% - 6px) 100%, 6px 100%, 0 calc(100% - 6px), 0 6px)' }}>
+                  <label className="flex items-center gap-2 border border-text/15 px-3 py-1.5" data-cut="6">
                     <input value={d.devBuy} onChange={(e) => up({ devBuy: e.target.value.replace(',', '.') })} inputMode="decimal" className="w-20 bg-transparent text-sm font-semibold tabular-nums outline-none" aria-label="Dev buy in SOL" aria-invalid={!devOk} />
                     <span className="text-sm text-text/60">SOL</span>
                   </label>
                 </div>
-                {!devOk && <p className="mt-2 text-xs text-raid">Dev buy must be a number from 0 to {MAX_DEV}.</p>}
+                {!devOk && <p className="mt-2 text-xs text-raid">Dev buy must be a number from 0 to {maxDev}.</p>}
                 <div className="mt-5 divide-y divide-text/10 border-y border-text/10">
-                  <Row label="Launch cost (now)" sub="Creating the coin on pump.fun and locking its fee split." value={`${LAUNCH_COST.toFixed(3)} SOL`} />
-                  <Row label={theme.copy.launch.reserveLabel} sub={`Gas for her hourly ${theme.verbs.burn}, ${theme.verbs.store.split(' ')[0]} and ${theme.verbs.interact} transactions.`} value={`${QUEEN_RESERVE.toFixed(3)} SOL`} />
+                  <Row label="Launch cost (now)" sub="Creating the coin on pump.fun and locking its fee split." value={`${costs.launchCost.toFixed(3)} SOL`} />
+                  <Row label={theme.copy.launch.reserveLabel} sub={`Gas for her hourly ${theme.verbs.burn}, ${theme.verbs.store.split(' ')[0]} and ${theme.verbs.interact} transactions.`} value={`${costs.queenReserve.toFixed(3)} SOL`} />
                   <Row label="Dev buy" sub="Bought at launch, the tokens go to your wallet." value={`${dev.toFixed(3)} SOL`} />
-                  <Row label="You send" value={`${total.toFixed(3)} SOL`} strong />
+                  <Row label={isLive ? 'You send' : 'You would send'} sub={serverConfig ? undefined : 'Estimate until the server answers.'} value={`${total.toFixed(3)} SOL`} strong />
                 </div>
                 <Note icon="✓">
-                  <b>What you sign:</b> one plain SOL transfer of {total.toFixed(3)} SOL from your wallet to your {theme.unit}&rsquo;s {theme.agent} wallet. Nothing else.
+                  {isLive ? (
+                    <>
+                      <b>What you sign:</b> a free message proving the wallet is yours, then one plain SOL transfer of {total.toFixed(3)} SOL from your wallet to your {theme.unit}&rsquo;s {theme.agent} wallet. Nothing else. If the launch fails, you can refund it.
+                    </>
+                  ) : (
+                    <>
+                      <b>What you sign:</b> nothing. Preview launches need no wallet and send nothing.
+                    </>
+                  )}
                 </Note>
-                <Note icon="⬡">
+                <Note icon={GLYPH.outline}>
                   <b>Fees:</b> your coin&rsquo;s creator fees go {pct(1 - theme.feeToHub)} to your {theme.agent}, {pct(theme.feeToHub)} to the hourly {theme.hubRitual} that buys {theme.hubToken.symbol}. Locked at launch.
                 </Note>
                 <label className="mt-3 flex cursor-pointer items-start gap-3 border border-raid/30 bg-raid/[0.07] p-4 text-sm leading-relaxed">
@@ -592,8 +1027,14 @@ export default function LaunchWizard() {
                   </span>
                 </label>
                 <div className="mt-4 border border-accent/30 bg-accent/[0.06] p-4">
-                  <div className="font-heading text-base font-semibold text-accent">◈ Last step: connect the wallet that will own the {theme.unit}</div>
-                  <p className="mt-1 text-xs leading-relaxed text-text/65">Connecting signs nothing. Launching asks for one transfer. In this preview build the launch is simulated and nothing is sent.</p>
+                  <div className="font-heading text-base font-semibold text-accent">
+                    {isLive ? `◈ Last step: connect the wallet that will own the ${theme.unit}` : `◈ Optional: connect a wallet to own the ${theme.unit}`}
+                  </div>
+                  <p className="mt-1 text-xs leading-relaxed text-text/65">
+                    {isLive
+                      ? 'Connecting signs nothing. Launching asks you to sign a free message, then approve one transfer.'
+                      : `Without a wallet the ${theme.unit} is saved under a guest id in this browser. Nothing is signed or sent either way.`}
+                  </p>
                   <div className="mt-3 flex flex-wrap items-center gap-3">
                     {publicKey ? (
                       <span className="shape-btn btn-ghost inline-flex h-9 items-center text-xs font-semibold">Connected {short(publicKey.toBase58())} ✓</span>
@@ -606,6 +1047,8 @@ export default function LaunchWizard() {
                 </div>
               </section>
             )}
+            </>
+            )}
             {err && <p className="mt-4 text-sm text-raid" role="alert">{err}</p>}
           </div>
 
@@ -614,7 +1057,7 @@ export default function LaunchWizard() {
             <div className="mb-3 flex items-center gap-2 font-heading text-sm font-semibold">
               <span className="inline-block h-2 w-2 animate-pulse rounded-full bg-soft" /> Live preview
             </div>
-            <QueenPreview look={d.look} speaking={bubble} className="h-56 border border-text/10" />
+            {wideLayout && <QueenPreview look={d.look} speaking={bubble} className="h-56 border border-text/10" />}
             <div className="mt-4 border border-text/10 bg-night/40 p-5">
               <div className="flex items-start gap-3">
                 <div className="shape-hex h-14 w-12 shrink-0 overflow-hidden bg-accent/20">{image && <img src={image} alt="" className="h-full w-full object-cover" />}</div>
@@ -625,7 +1068,7 @@ export default function LaunchWizard() {
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
                 <Chip>◆ {dipName}</Chip>
-                <Chip>⬢ {swarmName}</Chip>
+                <Chip>{GLYPH.solid} {swarmName}</Chip>
               </div>
               <dl className="mt-4 grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
                 <Stat k="Dev buy" v={`${dev.toFixed(2)} SOL`} />
@@ -642,6 +1085,12 @@ export default function LaunchWizard() {
 
         {/* footer */}
         <div className="flex items-center justify-between gap-3 border-t border-accent/10 px-4 py-3 sm:px-6">
+          {run || localOnly ? (
+            <span className="w-full text-center font-heading text-sm font-semibold text-text/55">
+              {localOnly ? 'Preview only' : busy ? 'Working…' : run?.status?.state === 'live' ? `Your ${theme.unit} is live` : 'Launch in progress'}
+            </span>
+          ) : (
+          <>
           {d.step > 0 ? (
             <button onClick={() => go(d.step - 1)} data-sfx="none" className="shape-btn btn-ghost h-11 font-heading text-base font-semibold">
               Back
@@ -657,9 +1106,11 @@ export default function LaunchWizard() {
               Next
             </button>
           ) : (
-            <button onClick={launch} disabled={busy} data-sfx="none" className={`shape-btn btn-honey h-11 font-heading text-base font-semibold ${busy ? 'opacity-60' : ''}`}>
-              {busy ? 'Founding…' : publicKey ? theme.copy.launch.cta : 'Connect wallet'}
+            <button onClick={launch} disabled={busy || configLoading} data-sfx="none" className={`shape-btn btn-honey h-11 font-heading text-base font-semibold ${busy || configLoading ? 'opacity-60' : ''}`}>
+              {busy ? 'Founding…' : configLoading ? 'Loading…' : !isLive ? `${theme.copy.launch.cta} (preview)` : publicKey ? theme.copy.launch.cta : 'Connect wallet'}
             </button>
+          )}
+          </>
           )}
         </div>
       </div>
@@ -680,11 +1131,24 @@ function StepTitle({ icon, title, sub }: { icon: string; title: string; sub?: st
 }
 
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
+  const title = (
+    <span className="mb-1.5 block font-heading text-sm font-semibold">
+      {label} {hint && <span className="text-xs font-normal text-text/50">{hint}</span>}
+    </span>
+  );
+  // a lone text control: wrap it in a <label> so its accessible name is the field name, not the placeholder
+  const isControl = isValidElement(children) && (children.type === 'input' || children.type === 'textarea');
+  if (isControl) {
+    return (
+      <label className="mt-4 block">
+        {title}
+        {children}
+      </label>
+    );
+  }
   return (
-    <div className="mt-4">
-      <div className="mb-1.5 font-heading text-sm font-semibold">
-        {label} {hint && <span className="text-xs font-normal text-text/50">{hint}</span>}
-      </div>
+    <div className="mt-4" role="group" aria-label={label}>
+      {title}
       {children}
     </div>
   );
@@ -740,7 +1204,7 @@ function OptionCard({ active, onClick, icon, title, body, risk, foot }: { active
       data-sfx="select"
       aria-pressed={active}
       className={`flex h-full gap-3 border-2 p-4 text-left transition-colors duration-600 ${active ? 'border-accent bg-accent/10' : 'border-text/10 bg-night/30 hover:border-accent/40'}`}
-      style={{ clipPath: 'polygon(10px 0, calc(100% - 10px) 0, 100% 10px, 100% calc(100% - 10px), calc(100% - 10px) 100%, 10px 100%, 0 calc(100% - 10px), 0 10px)' }}
+      data-cut="10"
     >
       <span className="mt-0.5 text-lg text-accent">{icon}</span>
       <span className="min-w-0">

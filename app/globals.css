@@ -319,3 +319,304 @@ html[data-mode='day'] .wiz-range {
 .wiz-range:focus-visible {
   box-shadow: 0 0 0 3px rgb(var(--c-accent) / 0.35);
 }
+
+/* ---------- ambient life (components/fx) ---------- */
+/* One fixed overlay above the page (nav is z-40, modals z-50). Only coins and the bee catch clicks. */
+.fx-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 35;
+  pointer-events: none;
+  overflow: hidden;
+  contain: strict;
+}
+@media (prefers-reduced-motion: reduce) {
+  .fx-layer {
+    display: none;
+  }
+}
+.fx-layer button {
+  padding: 0;
+  border: 0;
+  background: none;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+/* money splash: a burst origin, SOL coins, honey drops and a rising label */
+.mc-burst {
+  position: absolute;
+  width: 0;
+  height: 0;
+}
+.mc-coin,
+.mc-drop {
+  position: absolute;
+  left: 0;
+  top: 0;
+  opacity: 0; /* the first animation frame fades them in */
+  will-change: transform, opacity;
+}
+.fx-layer .mc-coin {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 50%;
+  pointer-events: auto;
+  cursor: pointer;
+  font-family: var(--f-heading);
+  font-weight: 700;
+  line-height: 1;
+  color: rgb(70 42 4 / 0.82);
+  background: radial-gradient(circle at 34% 30%, rgb(255 250 228) 0 9%, rgb(var(--c-soft)) 30%, rgb(var(--c-accent)) 68%, rgb(var(--c-accent) / 0.85) 100%);
+  box-shadow:
+    inset 0 0 0 1.5px rgb(255 255 255 / 0.4),
+    inset 0 0 0 3px rgb(var(--c-accent)),
+    inset 0 -3px 4px rgb(60 30 0 / 0.25),
+    0 2px 0 rgb(120 70 0 / 0.75),
+    0 6px 14px -4px rgb(0 0 0 / 0.5);
+}
+.fx-layer .mc-coin.pop {
+  pointer-events: none; /* a popped coin fades out; it no longer catches clicks */
+  animation: mcPop 440ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+/* the sparkle: one pseudo-element, eight glints drawn with box-shadows */
+.mc-coin::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 4px;
+  height: 4px;
+  margin: -2px 0 0 -2px;
+  border-radius: 50%;
+  background: #fff;
+  opacity: 0;
+  pointer-events: none;
+  box-shadow:
+    0 -17px 0 0 #fff,
+    12px -12px 0 0 rgb(var(--c-soft)),
+    17px 0 0 0 #fff,
+    12px 12px 0 0 rgb(var(--c-soft)),
+    0 17px 0 0 #fff,
+    -12px 12px 0 0 rgb(var(--c-soft)),
+    -17px 0 0 0 #fff,
+    -12px -12px 0 0 rgb(var(--c-soft));
+}
+.mc-coin.pop::after {
+  animation: mcSparkle 480ms ease-out forwards;
+}
+.mc-drop {
+  border-radius: 50% 0 50% 50%; /* a teardrop pointing at its top-right corner */
+  background: radial-gradient(circle at 58% 42%, rgb(255 255 255 / 0.7) 0 12%, rgb(var(--c-soft)) 32%, rgb(var(--c-accent)) 78%);
+  box-shadow: 0 2px 8px -2px rgb(var(--c-accent) / 0.7);
+}
+.mc-label {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform: translate(-50%, -50%);
+  white-space: nowrap;
+  font-family: var(--f-heading);
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+  color: rgb(var(--c-soft));
+  text-shadow:
+    0 1px 0 rgb(0 0 0 / 0.45),
+    0 0 18px rgb(var(--c-accent) / 0.65);
+  opacity: 0;
+  animation: mcLabel 1900ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+html[data-mode='day'] .mc-label {
+  color: rgb(var(--c-accent));
+  text-shadow:
+    0 1px 0 rgb(255 255 255 / 0.8),
+    0 0 14px rgb(var(--c-soft) / 0.5);
+}
+@keyframes mcPop {
+  0% {
+    scale: 1;
+    opacity: 1;
+  }
+  35% {
+    scale: 1.45;
+    opacity: 1;
+  }
+  100% {
+    scale: 1.9;
+    opacity: 0;
+  }
+}
+@keyframes mcSparkle {
+  0% {
+    opacity: 1;
+    transform: scale(0.35) rotate(0deg);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1.7) rotate(40deg);
+  }
+}
+@keyframes mcLabel {
+  0% {
+    opacity: 0;
+    translate: 0 8px;
+  }
+  14% {
+    opacity: 1;
+  }
+  68% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    translate: 0 -58px;
+  }
+}
+
+/* flying bee: the button moves (translate only, so its shadow stays below), the svg turns */
+.fx-layer .bee-fly {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 56px;
+  height: 44px;
+  margin: -22px 0 0 -28px;
+  pointer-events: auto;
+  cursor: pointer;
+  will-change: transform;
+}
+.bee-fly svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  will-change: transform;
+}
+.bee-shadow {
+  position: absolute;
+  left: 50%;
+  top: 100%;
+  width: 24px;
+  height: 6px;
+  margin: 2px 0 0 -12px;
+  border-radius: 50%;
+  background: radial-gradient(closest-side, rgb(0 0 0 / 0.3), transparent);
+}
+.bee-wing {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  animation: beeFlap 64ms linear infinite alternate;
+}
+.bee-wing.b {
+  animation-delay: -32ms;
+}
+.bee-fly.fast .bee-wing {
+  animation-duration: 36ms;
+}
+@keyframes beeFlap {
+  from {
+    transform: rotate(-8deg) scaleY(1);
+  }
+  to {
+    transform: rotate(10deg) scaleY(0.32);
+  }
+}
+/* the honey splash a caught bee leaves behind: a ring (::before) and falling drops (::after) */
+.bee-splash {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+  background: radial-gradient(circle at 40% 35%, rgb(255 255 255 / 0.7) 0 15%, rgb(var(--c-soft)) 35%, rgb(var(--c-accent)) 80%);
+  animation: beeSplash 950ms cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+.bee-splash::before {
+  content: '';
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid rgb(var(--c-soft) / 0.9);
+  animation: beeRing 650ms ease-out forwards;
+}
+.bee-splash::after {
+  content: '';
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 5px;
+  height: 6px;
+  margin: -3px 0 0 -2.5px;
+  border-radius: 50% 50% 50% 50% / 60% 60% 40% 40%;
+  background: rgb(var(--c-accent));
+  box-shadow:
+    -11px 4px 0 -1px rgb(var(--c-soft)),
+    10px 2px 0 0 rgb(var(--c-accent)),
+    -4px 9px 0 -1px rgb(var(--c-accent)),
+    6px 10px 0 -1.5px rgb(var(--c-soft));
+  animation: beeDrops 950ms cubic-bezier(0.55, 0, 0.9, 0.5) forwards;
+}
+@keyframes beeSplash {
+  0% {
+    scale: 0.4;
+    opacity: 1;
+  }
+  25% {
+    scale: 1.35;
+  }
+  100% {
+    scale: 0.9;
+    opacity: 0;
+    translate: 0 26px;
+  }
+}
+@keyframes beeRing {
+  0% {
+    transform: scale(0.5);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(3.2);
+    opacity: 0;
+  }
+}
+@keyframes beeDrops {
+  0% {
+    transform: translateY(0) scaleY(1);
+    opacity: 1;
+  }
+  100% {
+    transform: translateY(46px) scaleY(1.5);
+    opacity: 0;
+  }
+}
+
+/* chamfered chips/cards set with data-cut="6|8|10"; rounded under the circle theme */
+[data-cut] {
+  --chamfer: 8px;
+  clip-path: polygon(var(--chamfer) 0, calc(100% - var(--chamfer)) 0, 100% var(--chamfer), 100% calc(100% - var(--chamfer)), calc(100% - var(--chamfer)) 100%, var(--chamfer) 100%, 0 calc(100% - var(--chamfer)), 0 var(--chamfer));
+}
+[data-cut='6'] {
+  --chamfer: 6px;
+}
+[data-cut='10'] {
+  --chamfer: 10px;
+}
+html[data-shape='circle'] [data-cut] {
+  clip-path: none;
+  border-radius: 12px;
+}
+
+/* clip-path cuts off outlines: draw keyboard focus inside the shape instead */
+.shape-btn:focus-visible,
+.shape-hex:focus-visible,
+.shape-card:focus-visible,
+.shape-avatar:focus-visible,
+[data-cut]:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px rgb(var(--c-accent)), inset 0 0 0 4px rgb(var(--c-base) / 0.7);
+}

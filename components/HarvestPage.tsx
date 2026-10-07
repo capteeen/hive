@@ -122,9 +122,13 @@ export default function HarvestPage() {
                     </td>
                     <td className="px-4 py-3 text-right text-royal">{fmtCompact(h.jellyAmount)}</td>
                     <td className="px-4 py-3 text-right">
-                      <a href={txUrl(h.txSig)} target="_blank" rel="noreferrer" className="text-accent/80 hover:text-accent">
-                        {short(h.txSig, 4)} ↗
-                      </a>
+                      {h.dryRun || !h.txSig ? (
+                        <span className="text-text/45" title="Planned by the engine in dry-run mode: nothing was sent">dry run</span>
+                      ) : (
+                        <a href={txUrl(h.txSig)} target="_blank" rel="noreferrer" className="text-accent/80 hover:text-accent">
+                          {short(h.txSig, 4)} ↗
+                        </a>
+                      )}
                     </td>
                   </tr>
                 );

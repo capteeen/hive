@@ -1,11 +1,13 @@
 'use client';
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNow } from '@/lib/useNow';
 import { useHive } from '@/lib/store';
+import { fetchHiveDetail } from '@/lib/remote';
+import type { HiveDetailResponse } from '@/lib/shared/rows';
 import { theme } from '@/themes';
-import { fmtNum, fmtSol, short, addrUrl, pumpUrl, aliveFor, timeAgo } from '@/lib/format';
+import { fmtNum, fmtSol, short, addrUrl, aliveFor, timeAgo } from '@/lib/format';
 import { feeGrowth } from '@/lib/sim';
 import { DEFAULT_RULES, rulesSummary } from '@/lib/queen';
 import HexButton from '@/components/HexButton';
@@ -13,12 +15,107 @@ import HexBar from '@/components/HexBar';
 import Avatar from '@/components/Avatar';
 import Log from '@/components/Log';
 import PriceChart from '@/components/PriceChart';
-import { StateBadge } from '@/components/Badges';
+import { SourceBadge, StateBadge, TradeLink } from '@/components/Badges';
 import HarvestCountdown from '@/components/HarvestCountdown';
 import PourCounter from '@/components/PourCounter';
 
 const CombScene = dynamic(() => import('@/components/comb/CombScene'), { ssr: false });
 const cap = (s: string) => s[0].toUpperCase() + s.slice(1);
+
+/* ---------- looking up an address the store does not hold ---------- */
+
+/**
+ * What the page knows about a CA that is not in the store:
+ *   checking    - asking the server (or the store has not started yet)
+ *   missing     - the server answered 404: no hive was launched with this address
+ *   unreachable - the server did not answer (network, 5xx, timeout, garbled body); retrying
+ */
+export type HiveLookup = 'checking' | 'missing' | 'unreachable';
+
+export interface HiveLookupDeps {
+  /** GET /api/hives/[ca]: null on 404, throws on any other failure (lib/remote.ts fetchHiveDetail). */
+  fetchDetail: (ca: string, signal: AbortSignal) => Promise<HiveDetailResponse | null>;
+  /** Put the server's copy into the store. Returns whether the store now holds the hive. */
+  adopt: (detail: HiveDetailResponse) => boolean;
+  onState: (state: HiveLookup) => void;
+  /** Per-attempt timeout, so a hung request cannot leave the page "looking" forever. */
+  timeoutMs?: number;
+  /** Delay before retry number `attempt` (0-based). */
+  retryMs?: (attempt: number) => number;
+}
+
+const LOOKUP_TIMEOUT_MS = 10_000;
+const lookupBackoff = (attempt: number) => Math.round(Math.min(30_000, 1000 * 2 ** Math.min(attempt, 5)) * (0.8 + Math.random() * 0.4));
+
+/** The detail body is only trusted when it describes this exact CA in a shape applyRemote can place. */
+function isDetailFor(ca: string, d: HiveDetailResponse): boolean {
+  const h = d?.hive;
+  return !!h && h.ca === ca && Number.isInteger(h.cell?.q) && Number.isInteger(h.cell?.r) && Number.isFinite(h.updatedAt) && Array.isArray(d.actions);
+}
+
+/**
+ * Decide whether `ca` exists by asking the server directly, instead of waiting for the comb's list
+ * sync. The realtime feed turning 'live' says nothing about whether GET /api/hives has arrived (it
+ * can be slow on a cold start, or 500 and back off for up to 30s), so neither feed status nor a timer
+ * can prove a hive does not exist: only a 404 from /api/hives/[ca] does. When the server knows the
+ * hive it is adopted into the store right away, so a shared link opens without waiting for the list.
+ * Returns a stop function (aborts the request in flight and any pending retry).
+ */
+export function watchHiveLookup(ca: string, deps: HiveLookupDeps): () => void {
+  const timeoutMs = deps.timeoutMs ?? LOOKUP_TIMEOUT_MS;
+  const retryMs = deps.retryMs ?? lookupBackoff;
+  let stopped = false;
+  let attempt = 0;
+  let retry: ReturnType<typeof setTimeout> | null = null;
+  let inflight: AbortController | null = null;
+
+  const once = async () => {
+    retry = null;
+    if (stopped) return;
+    const ac = new AbortController();
+    inflight = ac;
+    const killer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const detail = await deps.fetchDetail(ca, ac.signal);
+      if (stopped) return;
+      if (detail === null) {
+        deps.onState('missing');
+        return;
+      }
+      if (!isDetailFor(ca, detail)) throw new Error('unexpected hive detail');
+      // Adopted: the page re-renders with the hive and stops this watcher. Not adopted means the
+      // store refused it (its cell is taken by a demo hive), so it cannot be shown on the comb either.
+      if (!deps.adopt(detail)) deps.onState('missing');
+    } catch {
+      if (stopped) return;
+      deps.onState('unreachable');
+      retry = setTimeout(() => void once(), retryMs(attempt++));
+    } finally {
+      clearTimeout(killer);
+      if (inflight === ac) inflight = null;
+    }
+  };
+
+  deps.onState('checking');
+  void once();
+  return () => {
+    stopped = true;
+    if (retry) clearTimeout(retry);
+    retry = null;
+    inflight?.abort();
+    inflight = null;
+  };
+}
+
+/** Store-side adoption of a hive the server knows: the hive plus its own recent actions, as catch-up (no animations). */
+export function adoptIntoStore(ca: string, detail: HiveDetailResponse): boolean {
+  const s = useHive.getState();
+  if (!s.world.hives[ca]) {
+    const actions = detail.actions.filter((a) => !!a && a.ca === ca && typeof a.id === 'string' && Number.isFinite(a.at));
+    s.applyRemote({ hives: [detail.hive], actions }, { initial: true });
+  }
+  return !!useHive.getState().world.hives[ca];
+}
 
 function Copy({ value }: { value: string }) {
   const [ok, setOk] = useState(false);
@@ -44,15 +141,42 @@ export default function HivePage({ ca }: { ca: string }) {
   const hives = useHive((s) => s.world.hives);
   const now = useNow(5000);
   const maxHoney = useHive((s) => Math.max(1, ...s.world.order.map((c) => s.world.hives[c].honey)));
+  const started = useHive((s) => s.started);
+  const present = !!hive;
+  // Hives launched by other users are not in the store until the comb's list sync lands, which can
+  // take a while (or fail and back off). Ask the server about this one address instead: only its 404
+  // proves the hive does not exist. Waits for start(), which re-seeds the world and would drop an
+  // adopted hive. Keyed by CA so a stale answer for the previous address never shows.
+  const [lookup, setLookup] = useState<{ ca: string; state: HiveLookup }>({ ca, state: 'checking' });
+  useEffect(() => {
+    if (present || !started) return;
+    return watchHiveLookup(ca, {
+      fetchDetail: fetchHiveDetail,
+      adopt: (detail) => adoptIntoStore(ca, detail),
+      onState: (state) => setLookup({ ca, state }),
+    });
+  }, [ca, started, present]);
 
   if (!hive) {
+    const state: HiveLookup = started && lookup.ca === ca ? lookup.state : 'checking';
+    const done = state !== 'checking';
     return (
       <div className="mx-auto max-w-[1400px] px-4 pt-32 sm:px-6">
-        <h1 className="font-heading text-3xl font-semibold">No {theme.unit} at this address.</h1>
-        <p className="mt-2 text-text/60">In Phase 1 only the simulated {theme.unitPlural} and the ones you found in this session exist.</p>
-        <HexButton href="/comb" className="mt-6">
-          Back to the {theme.scene}
-        </HexButton>
+        <h1 className="font-heading text-3xl font-semibold">
+          {state === 'missing' ? `No ${theme.unit} at this address.` : state === 'unreachable' ? `Still looking for this ${theme.unit}…` : `Looking for this ${theme.unit}…`}
+        </h1>
+        <p className="mt-2 text-text/60" aria-live="polite">
+          {state === 'missing'
+            ? `Nothing on the ${theme.scene} has this address. It may be a coin that was not launched through ${theme.name}.`
+            : state === 'unreachable'
+              ? `The server did not answer, so ${theme.unitPlural} launched by other people cannot be checked yet. Trying again…`
+              : `Checking the ${theme.scene} for ${short(ca, 5)}.`}
+        </p>
+        {done && (
+          <HexButton href="/comb" className="mt-6">
+            Back to the {theme.scene}
+          </HexButton>
+        )}
       </div>
     );
   }
@@ -82,6 +206,7 @@ export default function HivePage({ ca }: { ca: string }) {
               <h1 className="truncate font-heading text-4xl font-semibold tracking-tight sm:text-5xl">{hive.name}</h1>
               <div className="mt-1 flex flex-wrap items-center gap-3 text-sm text-text/60">
                 <span className="text-accent">${hive.ticker}</span>
+                <SourceBadge hive={hive} size="sm" />
                 <span>alive {now === null ? '…' : aliveFor(hive.bornAt, now)}</span>
                 <span>last fee {now === null ? '…' : timeAgo(hive.lastFeeAt, now)}</span>
               </div>
@@ -105,9 +230,8 @@ export default function HivePage({ ca }: { ca: string }) {
           </div>
           <QueenRulesCard hive={hive} />
           <div className="mt-6 flex flex-wrap items-center gap-3">
-            <HexButton href={pumpUrl(hive.ca)} target="_blank" rel="noreferrer">
-              Trade on pump.fun ↗
-            </HexButton>
+            {/* demo and preview CAs are not real coins: TradeLink renders a muted stand-in for them */}
+            <TradeLink hive={hive}>Trade on pump.fun ↗</TradeLink>
             <HexButton variant="ghost" href="/comb">
               Find on the {theme.scene}
             </HexButton>

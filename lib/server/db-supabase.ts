@@ -16,6 +16,8 @@ import type { Db, LaunchRecord } from './db';
 
 /** PostgREST's default max rows per request; listHives / takenCells page through it. */
 const PAGE = 1000;
+/** Most price points listPrices returns (the newest ones); matches FileDb's per-hive cap. */
+const PRICE_LIST_MAX = 2000;
 /** Price points older than this are pruned (the UI reads 24h; the chart a few days at most). */
 const PRICE_RETENTION_MS = 14 * 24 * 3600_000;
 
@@ -326,10 +328,28 @@ export class SupabaseDb implements Db {
     }
   }
 
+  /**
+   * The newest PRICE_LIST_MAX points at or after `since`, oldest first (FileDb keeps the same newest
+   * slice per hive). Read newest first and paged: PostgREST caps every response (max-rows), and a cap
+   * applied to an ascending read would cut the newest points, i.e. the current price.
+   */
   async listPrices(ca: string, since: number): Promise<{ at: number; price: number }[]> {
-    const { data, error } = await this.sb.from('prices').select('at,price').eq('ca', ca).gte('at', toIso(since)).order('at', { ascending: true }).limit(2000);
-    if (error) fail('listPrices', error);
-    return mapRows(data, rowToPrice);
+    const byAt = new Map<number, { at: number; price: number }>();
+    for (let from = 0; from < PRICE_LIST_MAX; from += PAGE) {
+      const to = Math.min(from + PAGE, PRICE_LIST_MAX) - 1;
+      const { data, error } = await this.sb
+        .from('prices')
+        .select('at,price')
+        .eq('ca', ca)
+        .gte('at', toIso(since))
+        .order('at', { ascending: false })
+        .range(from, to);
+      if (error) fail('listPrices', error);
+      // a point inserted between two pages shifts the next page by one row: (ca, at) is unique, so dedupe on at
+      for (const p of mapRows(data, rowToPrice)) byAt.set(p.at, p);
+      if (!data || data.length < to - from + 1) break; // short page: the window is exhausted (or max-rows < PAGE)
+    }
+    return [...byAt.values()].sort((a, b) => a.at - b.at);
   }
 
   /* ---------- change feed ---------- */

@@ -6,11 +6,11 @@ import { useUI } from '@/lib/ui';
 import { theme } from '@/themes';
 import { axialToXY, cellKey, hexDistance, neighbors } from '@/lib/hex';
 import { feeGrowth, isFoundable, LAUNCH_COST, QUEEN_RESERVE } from '@/lib/sim';
-import { fmtNum, fmtSol, pumpUrl, short, timeAgo } from '@/lib/format';
+import { fmtNum, fmtSol, short, timeAgo } from '@/lib/format';
 import { useNow } from '@/lib/useNow';
 import Avatar, { avatarBg } from '@/components/Avatar';
 import HexButton from '@/components/HexButton';
-import { StateBadge, VerbBadge } from '@/components/Badges';
+import { DryRunTag, SourceBadge, StateBadge, TradeLink, VerbBadge, isDryRun, stripDryRun } from '@/components/Badges';
 import type { Cell, CombPick, Hive } from '@/lib/types';
 
 const cap = (s: string) => s[0].toUpperCase() + s.slice(1);
@@ -56,14 +56,14 @@ export default function CellPanel({ pick, onClose, onPick, wide }: { pick: Exclu
         const style = { left: 66 + x - 19, top: 62 + y - 22, width: 38, height: 44 } as const;
         if (isCenter) {
           return (
-            <div key="c" className="shape-hex absolute flex items-center justify-center text-[10px] font-semibold" style={{ ...style, background: hive ? avatarBg(hive) : 'rgb(var(--c-accent) / 0.35)', color: 'rgb(var(--c-base))' }}>
+            <div key="c" className="shape-hex absolute flex items-center justify-center text-[10px] font-semibold" style={{ ...style, background: hive ? avatarBg(hive) : 'rgb(var(--c-accent) / 0.35)', color: '#1C1409' }}>
               {hive ? hive.ticker.slice(0, 3) : 'you'}
             </div>
           );
         }
         if (h) {
           return (
-            <button key={i} onClick={() => onPick({ kind: 'hive', ca: h.ca })} title={`${h.name} · ${fmtSol(h.honey, 1)}`} data-sfx="select" className="shape-hex absolute flex items-center justify-center text-[9px] font-semibold opacity-90 transition-transform duration-600 hover:scale-110" style={{ ...style, background: avatarBg(h), color: 'rgb(var(--c-base))' }}>
+            <button key={i} onClick={() => onPick({ kind: 'hive', ca: h.ca })} title={`${h.name} · ${fmtSol(h.honey, 1)}`} data-sfx="select" className="shape-hex absolute flex items-center justify-center text-[9px] font-semibold opacity-90 transition-transform duration-600 hover:scale-110" style={{ ...style, background: avatarBg(h), color: '#1C1409' }}>
               {h.ticker.slice(0, 3)}
             </button>
           );
@@ -72,8 +72,8 @@ export default function CellPanel({ pick, onClose, onPick, wide }: { pick: Exclu
         return (
           <button
             key={i}
-            disabled={!free}
-            onClick={() => onPick({ kind: 'empty', q: c.q, r: c.r })}
+            aria-disabled={!free}
+            onClick={() => free && onPick({ kind: 'empty', q: c.q, r: c.r })}
             title={free ? 'Free cell' : 'Not on the edge yet'}
             data-sfx="empty"
             className={`shape-hex absolute flex items-center justify-center text-sm transition-transform duration-600 ${free ? 'bg-accent/15 text-accent hover:scale-110 hover:bg-accent/30' : 'bg-text/5 text-text/20'}`}
@@ -133,7 +133,7 @@ export default function CellPanel({ pick, onClose, onPick, wide }: { pick: Exclu
         </div>
         <p className="mt-3 text-xs text-text/50">{cap(theme.verbs.interact)}s target neighbours, so where you settle matters. Launch from {fmtSol(LAUNCH_COST + QUEEN_RESERVE, 3)}.</p>
         <div className="mt-4 flex gap-2">
-          <HexButton size="sm" disabled={!foundable} className={foundable ? '' : 'opacity-50'} onClick={() => openLaunch(cell)} data-sfx="open">
+          <HexButton size="sm" aria-disabled={!foundable} className={foundable ? '' : 'opacity-50'} onClick={() => foundable && openLaunch(cell)} data-sfx={foundable ? 'open' : undefined}>
             Found a {theme.unit} here
           </HexButton>
           <HexButton size="sm" variant="ghost" onClick={onClose} data-sfx="close">
@@ -158,6 +158,7 @@ export default function CellPanel({ pick, onClose, onPick, wide }: { pick: Exclu
         </div>,
         <>
           <StateBadge state={hive.state} />
+          <SourceBadge hive={hive} />
           {hive.ca === world.biggestCa && <span className="shape-btn inline-flex h-6 items-center bg-royal/20 text-[10px] font-semibold uppercase tracking-wider text-royal">biggest</span>}
           {isMine && <span className="shape-btn inline-flex h-6 items-center bg-accent/20 text-[10px] font-semibold uppercase tracking-wider text-accent">{fresh ? 'yours · just founded' : 'yours'}</span>}
         </>,
@@ -184,8 +185,9 @@ export default function CellPanel({ pick, onClose, onPick, wide }: { pick: Exclu
             <li key={a.id} className="flex items-center gap-2 text-xs">
               <VerbBadge verb={a.verb} />
               <span className="min-w-0 flex-1 truncate text-text/65" title={a.reason}>
-                {a.targetCa === hive.ca && a.ca !== hive.ca ? `by ${world.hives[a.ca]?.ticker ?? short(a.ca)}` : a.reason}
+                {a.targetCa === hive.ca && a.ca !== hive.ca ? `by ${world.hives[a.ca]?.ticker ?? short(a.ca)}` : stripDryRun(a.reason)}
               </span>
+              {isDryRun(a.reason) && <DryRunTag />}
               <span className="shrink-0 text-text/40">{now === null ? '…' : timeAgo(a.at, now)}</span>
             </li>
           ))}
@@ -195,9 +197,10 @@ export default function CellPanel({ pick, onClose, onPick, wide }: { pick: Exclu
         <HexButton size="sm" href={`/hive/${hive.ca}`}>
           Open {theme.unit}
         </HexButton>
-        <HexButton size="sm" variant="ghost" href={pumpUrl(hive.ca)} target="_blank" rel="noreferrer">
+        {/* demo and preview CAs are not real coins: TradeLink renders a muted stand-in for them */}
+        <TradeLink hive={hive} size="sm" variant="ghost">
           Trade ↗
-        </HexButton>
+        </TradeLink>
         <HexButton
           size="sm"
           variant="ghost"

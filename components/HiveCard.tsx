@@ -6,7 +6,7 @@ import { fmtNum, fmtSol } from '@/lib/format';
 import { feeGrowth } from '@/lib/sim';
 import Avatar from './Avatar';
 import HexBar from './HexBar';
-import { StateBadge } from './Badges';
+import { SourceBadge, StateBadge } from './Badges';
 
 export default function HiveCard({ hive, maxHoney, biggest }: { hive: Hive; maxHoney: number; biggest: boolean }) {
   const g = feeGrowth(hive);
@@ -22,7 +22,10 @@ export default function HiveCard({ hive, maxHoney, biggest }: { hive: Hive; maxH
             <span className="truncate font-heading text-base font-semibold tracking-tight">{hive.name}</span>
             {biggest && <span className="shape-btn inline-flex h-5 items-center bg-royal/20 text-[10px] font-semibold uppercase tracking-wider text-royal">biggest</span>}
           </div>
-          <div className="text-xs text-text/55">${hive.ticker}</div>
+          <div className="mt-0.5 flex items-center gap-2 text-xs text-text/55">
+            <span>${hive.ticker}</span>
+            <SourceBadge hive={hive} size="sm" />
+          </div>
         </div>
         <StateBadge state={hive.state} />
       </div>

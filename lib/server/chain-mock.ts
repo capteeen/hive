@@ -9,6 +9,8 @@ import 'server-only';
  *    hourly engine has real-looking work: seals, stores, swarms, and eventually starving hives.
  *  - Prices random-walk; holders grow slowly. Signatures are fake 88-char base58 strings.
  *
+ * State is process-wide (kept on globalThis, see `sharedMockState`) for the default instance that
+ * getChain() builds, so the launch routes and the mock engine ticker see the same balances and coins.
  * Everything resets when the process restarts; unknown pubkeys simply have zero balances.
  */
 import { TOKEN_PROGRAM_ID } from '@solana/spl-token';
@@ -25,7 +27,7 @@ const CREATE_COST_LAMPORTS = 0.02 * LAMPORTS;
 const START_PRICE = 0.000000028;
 const MAX_PRICE = 0.001;
 
-interface MockCoin {
+export interface MockCoin {
   creator?: string;
   createdAt: number;
   price: number;
@@ -34,7 +36,7 @@ interface MockCoin {
   holdersAt: number;
 }
 
-interface FeeVault {
+export interface FeeVault {
   /** 0..1, how busy this creator's coin trades. */
   vigor: number;
   lastAt: number;
@@ -51,19 +53,64 @@ function hash01(s: string) {
   return (h >>> 0) / 4294967296;
 }
 
+/** Everything a MockChain remembers: the mock ledger. */
+export interface MockState {
+  /** Lamports per pubkey. */
+  sol: Map<string, number>;
+  /** Token units per `owner|mint`. */
+  tokens: Map<string, bigint>;
+  coins: Map<string, MockCoin>;
+  vaults: Map<string, FeeVault>;
+  /** Payment signatures already credited (each one counts once). */
+  credited: Set<string>;
+}
+
+const freshState = (): MockState => ({ sol: new Map(), tokens: new Map(), coins: new Map(), vaults: new Map(), credited: new Set() });
+
+/**
+ * The process-wide ledger, on globalThis. Next.js bundles route handlers and instrumentation.ts (which
+ * starts the mock engine ticker) as separate module copies, each with its own getChain() singleton and
+ * so its own MockChain. With per-instance state the engine would never see the SOL a launch deposited,
+ * the coin it created or its dev-buy tokens, and would overwrite the new hive's honey with 0. Same
+ * pattern as db-file.ts and engine-autorun.ts.
+ */
+const registry = globalThis as unknown as { __hiveMockChainV1?: MockState };
+export function sharedMockState(): MockState {
+  return (registry.__hiveMockChainV1 ??= freshState());
+}
+
+export interface MockChainOptions {
+  seed?: number;
+  /** Clock (ms); defaults to Date.now. */
+  now?: () => number;
+  /**
+   * Use the process-wide ledger (true) or a private one (false). Defaults to shared for a plain
+   * `new MockChain()` (what getChain() builds) and private when a seed or clock is injected (tests,
+   * simulations), so those never see or disturb the server's mock balances.
+   */
+  shared?: boolean;
+}
+
 export class MockChain implements Chain {
   readonly kind = 'mock' as const;
   private readonly rng: Rng;
   private readonly now: () => number;
-  private readonly sol = new Map<string, number>();
-  private readonly tokens = new Map<string, bigint>();
-  private readonly coins = new Map<string, MockCoin>();
-  private readonly vaults = new Map<string, FeeVault>();
-  private readonly credited = new Set<string>();
+  private readonly sol: Map<string, number>;
+  private readonly tokens: Map<string, bigint>;
+  private readonly coins: Map<string, MockCoin>;
+  private readonly vaults: Map<string, FeeVault>;
+  private readonly credited: Set<string>;
 
-  constructor(opts: { seed?: number; now?: () => number } = {}) {
+  constructor(opts: MockChainOptions = {}) {
     this.rng = mulberry32(opts.seed ?? (Date.now() ^ Math.floor(Math.random() * 0xffffffff)) >>> 0);
     this.now = opts.now ?? Date.now;
+    const shared = opts.shared ?? (opts.seed === undefined && opts.now === undefined);
+    const state = shared ? sharedMockState() : freshState();
+    this.sol = state.sol;
+    this.tokens = state.tokens;
+    this.coins = state.coins;
+    this.vaults = state.vaults;
+    this.credited = state.credited;
   }
 
   /* ---------- helpers ---------- */

@@ -3,6 +3,7 @@ import './globals.css';
 import Providers from './providers';
 import Nav from '@/components/Nav';
 import Footer from '@/components/Footer';
+import Ambient from '@/components/fx/Ambient';
 import { theme } from '@/themes';
 import { themeCss } from '@/lib/themeCss';
 
@@ -29,6 +30,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <Nav />
           <main className="min-h-screen">{children}</main>
           <Footer />
+          {/* money splashes + a passing bee; client-only, renders nothing on the server */}
+          <Ambient />
         </Providers>
       </body>
     </html>

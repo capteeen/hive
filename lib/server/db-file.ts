@@ -6,7 +6,8 @@ import 'server-only';
  * Layout (all files written atomically: tmp file + fsync + rename, mode 0600):
  *   hives/<ca>.json        one RemoteHive per file (hives carry images, so they are written one by one)
  *   launches/<id>.json     one LaunchRecord per file (payload carries the image)
- *   prices/<ca>.json       { ca, points } per hive, newest 2000 points, loaded lazily
+ *   prices/<ca>.json       { ca, points } per hive, newest 2000 points, loaded lazily (cached for
+ *                          real hives only, so unknown CAs never grow memory)
  *   actions.json           newest 5000, newest first
  *   harvests.json          newest 2000, newest first
  *   claims.json            cell claims
@@ -218,21 +219,34 @@ export class FileDb implements Db {
     return path.join(this.s.dir, rel);
   }
 
-  /** Lazily load one hive's price file (shared promise, so concurrent callers load it once). */
-  private loadPrices(ca: string): Promise<void> {
+  /** Read one CA's price file from disk (missing -> []). Does not touch the cache. */
+  private async readPrices(ca: string): Promise<PricePoint[]> {
+    const data = await readJson<{ ca: string; points: PricePoint[] } | null>(this.file(`prices/${fileKey(ca)}.json`), null);
+    return data && data.ca === ca && Array.isArray(data.points) ? data.points : [];
+  }
+
+  /**
+   * One CA's cached price list, loading it on first use (shared promise, so concurrent callers load it
+   * once). Only addPrice and known hives come through here, so the cache is bounded by the hives that
+   * exist, never by the CAs anonymous readers ask about.
+   */
+  private async cachedPrices(ca: string): Promise<PricePoint[]> {
     const s = this.s;
+    const hit = s.prices.get(ca);
+    if (hit) return hit;
     let p = s.pricesLoading.get(ca);
     if (!p) {
-      p = (async () => {
-        const data = await readJson<{ ca: string; points: PricePoint[] } | null>(this.file(`prices/${fileKey(ca)}.json`), null);
-        if (!s.prices.has(ca)) s.prices.set(ca, data && data.ca === ca && Array.isArray(data.points) ? data.points : []);
-      })().catch((e) => {
-        s.pricesLoading.delete(ca);
-        throw e;
-      });
+      p = this.readPrices(ca)
+        .then((pts) => {
+          if (!s.prices.has(ca)) s.prices.set(ca, pts);
+        })
+        .finally(() => {
+          s.pricesLoading.delete(ca); // loaded (now in s.prices) or failed (the next call retries)
+        });
       s.pricesLoading.set(ca, p);
     }
-    return p;
+    await p;
+    return s.prices.get(ca)!;
   }
 
   /** Queue a coalesced atomic write of one file. Resolves once a write that includes the current state finished. */
@@ -524,9 +538,8 @@ export class FileDb implements Db {
   async addPrice(ca: string, at: number, price: number): Promise<void> {
     if (!ca || !Number.isFinite(at) || !Number.isFinite(price) || price < 0) throw new Error('addPrice: invalid input.');
     await this.tx(async (t) => {
-      await this.loadPrices(ca);
       const s = this.s;
-      const pts = s.prices.get(ca)!;
+      const pts = await this.cachedPrices(ca);
       // keep ascending by time; the same timestamp twice (a retry) replaces the point
       let i = pts.length;
       while (i > 0 && pts[i - 1].at > at) i--;
@@ -539,8 +552,12 @@ export class FileDb implements Db {
 
   async listPrices(ca: string, since: number): Promise<{ at: number; price: number }[]> {
     await this.ready();
-    await this.loadPrices(ca);
-    return (this.s.prices.get(ca) ?? []).filter((p) => p.at >= since).map((p) => ({ at: p.at, price: p.price }));
+    const s = this.s;
+    // Known hives (and CAs addPrice already cached) are served from the cache. Any other CA, e.g. one a
+    // client typed into /api/hives/[ca], is read from disk without caching: it must not grow memory.
+    const known = s.prices.has(ca) || s.pricesLoading.has(ca) || s.hives.has(ca);
+    const pts = known ? await this.cachedPrices(ca) : await this.readPrices(ca);
+    return pts.filter((p) => p.at >= since).map((p) => ({ at: p.at, price: p.price }));
   }
 
   /* ---------- change feed ---------- */

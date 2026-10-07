@@ -8,7 +8,40 @@ import { createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 import { Keypair } from '@solana/web3.js';
 import { config } from './config';
 
-let devKey: Buffer | null = null;
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+
+const g = globalThis as unknown as { __hiveDevKey?: Buffer };
+
+/**
+ * Mock mode without QUEEN_KEY_SECRET: one key per data dir, persisted so queens founded before a
+ * restart stay decryptable, and shared via globalThis so the engine ticker (instrumentation) and the
+ * route handlers, which can load separate module instances, use the same key.
+ */
+function devKeyFor(): Buffer {
+  if (g.__hiveDevKey) return g.__hiveDevKey;
+  const file = path.join(config.dataDir, 'dev-queen-key');
+  let k: Buffer | null = null;
+  try {
+    const raw = readFileSync(file, 'utf8').trim();
+    const b = Buffer.from(raw, 'base64');
+    if (b.length === 32) k = b;
+  } catch {
+    /* first run */
+  }
+  if (!k) {
+    k = randomBytes(32);
+    try {
+      mkdirSync(config.dataDir, { recursive: true });
+      writeFileSync(file, k.toString('base64'), { mode: 0o600 });
+    } catch {
+      /* read-only fs (e.g. serverless): in-memory only */
+    }
+    console.warn('[hive] QUEEN_KEY_SECRET not set: using a development key (mock mode only).');
+  }
+  g.__hiveDevKey = k;
+  return k;
+}
 
 function key(): Buffer {
   const raw = config.queenKeySecret;
@@ -18,11 +51,7 @@ function key(): Buffer {
     return buf;
   }
   if (config.launchMode === 'live') throw new Error('QUEEN_KEY_SECRET is required in live mode.');
-  if (!devKey) {
-    devKey = randomBytes(32);
-    console.warn('[hive] QUEEN_KEY_SECRET not set: using a throwaway in-memory key (mock mode only).');
-  }
-  return devKey;
+  return devKeyFor();
 }
 
 export function encryptSecret(secret: Uint8Array): string {

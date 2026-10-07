@@ -33,7 +33,7 @@ export interface ThemeCopy {
   /** 3 feature cards. */
   feature: { title: string; body: string }[];
   /** Launch modal strings. */
-  launch: { title: string; cta: string; sentence: string; reserveLabel: string };
+  launch: { title: string; cta: string; sentence: string; reserveLabel: string; namePlaceholder: string; mottoPlaceholder: string; tickerPlaceholder: string };
   /** Per-verb short labels used in the log and markers. */
   verbLabels: Record<'burn' | 'store' | 'interact' | 'starve' | 'abandon', string>;
   /** Stats strip labels. */

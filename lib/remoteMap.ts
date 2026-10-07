@@ -47,4 +47,4 @@ export function remoteToHive(r: RemoteHive, prev?: Hive): Hive {
 
 export const remoteToAction = (a: RemoteAction): Action => ({ id: a.id, ca: a.ca, verb: a.verb, amount: a.amount, targetCa: a.targetCa, reason: a.dryRun ? `[dry run] ${a.reason}` : a.reason, txSig: a.dryRun ? undefined : a.txSig, at: a.at });
 
-export const remoteToHarvest = (h: RemoteHarvest): Harvest => ({ id: h.id, at: h.at, feesIn: h.feesIn, hiveBought: h.hiveBought, burned: h.burned, jellyTo: h.jellyTo, jellyAmount: h.jellyAmount, jellySol: h.jellySol, txSig: h.txSig });
+export const remoteToHarvest = (h: RemoteHarvest): Harvest => ({ id: h.id, at: h.at, feesIn: h.feesIn, hiveBought: h.hiveBought, burned: h.burned, jellyTo: h.jellyTo, jellyAmount: h.jellyAmount, jellySol: h.jellySol, txSig: h.dryRun ? '' : h.txSig, dryRun: h.dryRun });
