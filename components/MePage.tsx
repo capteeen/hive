@@ -44,7 +44,7 @@ export default function MePage() {
         </div>
         <div className="flex items-center gap-3">
           <WalletButton full />
-          <HexButton onClick={openLaunch}>Launch a {theme.unit}</HexButton>
+          <HexButton onClick={() => openLaunch()} data-sfx="open">Launch a {theme.unit}</HexButton>
         </div>
       </div>
       {!publicKey && (
@@ -64,7 +64,7 @@ export default function MePage() {
         ) : (
           <div className="shape-card glass mt-4 flex flex-wrap items-center justify-between gap-4 p-6">
             <p className="text-sm text-text/70">You haven’t founded a {theme.unit} yet. Your {theme.agent} is waiting.</p>
-            <HexButton onClick={openLaunch} size="sm">
+            <HexButton onClick={() => openLaunch()} data-sfx="open" size="sm">
               {theme.copy.launch.title}
             </HexButton>
           </div>

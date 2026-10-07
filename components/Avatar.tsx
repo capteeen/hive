@@ -7,12 +7,16 @@ function hue(s: string) {
   return h % 360;
 }
 
-export default function Avatar({ hive, size = 40, className = '' }: { hive: Pick<Hive, 'name' | 'ticker' | 'image' | 'state' | 'ca'>; size?: number; className?: string }) {
+export function avatarBg(hive: Pick<Hive, 'state' | 'ca'>) {
   const h = hue(hive.ca);
-  const grey = hive.state !== 'working';
-  const bg = grey
+  return hive.state !== 'working'
     ? 'linear-gradient(135deg, rgb(var(--c-starving)), rgb(var(--c-surface)))'
     : `linear-gradient(135deg, hsl(${h} 80% 62%), rgb(var(--c-accent)))`;
+}
+
+export default function Avatar({ hive, size = 40, className = '' }: { hive: Pick<Hive, 'name' | 'ticker' | 'image' | 'state' | 'ca'>; size?: number; className?: string }) {
+  const grey = hive.state !== 'working';
+  const bg = avatarBg(hive);
   return (
     <div className={`shape-avatar relative shrink-0 overflow-hidden ${className}`} style={{ width: size, height: size, background: bg }}>
       {hive.image ? (

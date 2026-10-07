@@ -7,6 +7,7 @@ import { useHive } from '@/lib/store';
 import { theme } from '@/themes';
 import { fmtNum, fmtSol, short, addrUrl, pumpUrl, aliveFor, timeAgo } from '@/lib/format';
 import { feeGrowth } from '@/lib/sim';
+import { DEFAULT_RULES, rulesSummary } from '@/lib/queen';
 import HexButton from '@/components/HexButton';
 import HexBar from '@/components/HexBar';
 import Avatar from '@/components/Avatar';
@@ -102,6 +103,7 @@ export default function HivePage({ ca }: { ca: string }) {
             <Stat label={`${theme.copy.reward} received`} value={fmtSol(hive.royalJelly, 2)} />
             <Stat label="sealed supply" value={`${(hive.sealed * 100).toFixed(1)}%`} sub={`total fees ${fmtSol(hive.feesTotal, 1)}`} />
           </div>
+          <QueenRulesCard hive={hive} />
           <div className="mt-6 flex flex-wrap items-center gap-3">
             <HexButton href={pumpUrl(hive.ca)} target="_blank" rel="noreferrer">
               Trade on pump.fun ↗
@@ -175,6 +177,37 @@ function SwarmList({ title, list, hives, tone, now }: { title: string; list: { i
         })}
         {!list.length && <li className="py-3 text-xs text-text/50">None yet.</li>}
       </ul>
+    </div>
+  );
+}
+
+function QueenRulesCard({ hive }: { hive: { rules?: import('@/lib/queen').QueenRules; temperament?: { dip: string; swarm: string }; motto?: string; description?: string } }) {
+  const r = hive.rules ?? DEFAULT_RULES;
+  const s = rulesSummary(r);
+  return (
+    <div className="shape-card glass mt-3 px-4 py-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-[10px] uppercase tracking-[0.16em] text-text/50">
+          her rules {hive.temperament ? `· ${hive.temperament.dip} · ${hive.temperament.swarm}` : '· protocol defaults'}
+        </div>
+        {hive.motto && <div className="text-xs italic text-text/60">&ldquo;{hive.motto}&rdquo;</div>}
+      </div>
+      <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-4">
+        <RuleStat k={`${cap(theme.verbs.burn)}s`} v={s.seal} />
+        <RuleStat k={`${cap(theme.verbs.interact)}s`} v={s.swarm} />
+        <RuleStat k={`${cap(theme.verbs.interact)} size`} v={s.size} />
+        <RuleStat k="Cooldown" v={s.cooldown} />
+      </div>
+      {hive.description && <p className="mt-2 text-xs leading-relaxed text-text/60">{hive.description}</p>}
+    </div>
+  );
+}
+
+function RuleStat({ k, v }: { k: string; v: string }) {
+  return (
+    <div>
+      <div className="text-[11px] text-text/50">{k}</div>
+      <div className="font-heading text-sm font-semibold text-accent">{v}</div>
     </div>
   );
 }

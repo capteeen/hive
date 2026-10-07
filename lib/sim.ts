@@ -12,6 +12,7 @@ import { theme } from '@/themes';
 import { mulberry32, mockAddress, mockSig, pick, range, type Rng } from './rng';
 import { spiral, neighbors, cellKey, hexDistance } from './hex';
 import type { Action, Harvest, Hive, HiveState, SceneEvent, SceneEventType, World, Cell } from './types';
+import { DEFAULT_RULES, clampRules, type QueenLook, type QueenRules } from './queen';
 
 export const HOUR_MS = 60_000;
 export const SEED = 0x5eed;
@@ -304,8 +305,8 @@ export function earnFees(world: World, h: Hive, amount: number, now: number, rng
   if (!viaSwarmFrom && rng() < 0.6) h.bees += Math.round(range(rng, 1, 6) * (1 + amount));
   if (h.bees > h.beesPeak) h.beesPeak = h.bees;
 
-  const rules = theme.rules;
-  if (h.price < h.avg24h) {
+  const rules: QueenRules = h.rules ?? DEFAULT_RULES;
+  if (h.price < h.avg24h * (1 - rules.sealTrigger)) {
     // SEAL
     const below = ((1 - h.price / h.avg24h) * 100).toFixed(1);
     const burn = budget * rules.burnShare;
@@ -317,7 +318,7 @@ export function earnFees(world: World, h: Hive, amount: number, now: number, rng
       ca: h.ca,
       verb: 'seal',
       amount: burn,
-      reason: `Price ${below}% below 24h average. ${Math.round(rules.burnShare * 100)}% of the hour’s fees bought and burned, ${Math.round(rules.storeShare * 100)}% stored.`,
+      reason: `Price ${below}% below 24h average${rules.sealTrigger > 0 ? ` (her trigger: ${Math.round(rules.sealTrigger * 100)}%)` : ''}. ${Math.round(rules.burnShare * 100)}% of the hour’s fees bought and burned, ${Math.round((1 - rules.burnShare) * 100)}% stored.`,
       txSig: mockSig(rng),
       at: now,
     });
@@ -330,7 +331,9 @@ export function earnFees(world: World, h: Hive, amount: number, now: number, rng
       amount: budget,
       reason: viaSwarmFrom
         ? `Swarmed by ${viaSwarmFrom.ticker}. Creator fee from the raid stored as ${theme.copy.resource}.`
-        : `Price above 24h average. Nothing to ${theme.verbs.burn}. Fees stored as ${theme.copy.resource}.`,
+        : h.price < h.avg24h
+          ? `Price below 24h average but not past her ${Math.round(rules.sealTrigger * 100)}% trigger. Fees stored as ${theme.copy.resource}.`
+          : `Price above 24h average. Nothing to ${theme.verbs.burn}. Fees stored as ${theme.copy.resource}.`,
       txSig: mockSig(rng),
       at: now,
     });
@@ -348,7 +351,7 @@ export function earnFees(world: World, h: Hive, amount: number, now: number, rng
       target.swarmsIn++;
       if (h.honey > target.honey) h.swarmsWon++;
       else target.swarmsWon++;
-      swarmCooldown.set(h.ca, now + HOUR_MS * (0.4 + rng() * 0.6));
+      swarmCooldown.set(h.ca, now + HOUR_MS * rules.cooldownH * (0.4 + rng() * 0.6));
       target.price *= 1 + Math.min(0.12, spend * 0.02);
       pushPrice(target, now);
       pushAction(world, {
@@ -471,12 +474,56 @@ export function stepWorld(world: World, clock: SimClock, now = Date.now()): bool
   return changed;
 }
 
+/* ---------- empty cells ---------- */
+export function occupiedKeys(world: World) {
+  return new Set(world.order.map((ca) => cellKey(world.hives[ca].cell)));
+}
+
+/**
+ * The empty cells a new unit can be founded in: every free cell that touches an occupied one.
+ * The comb only grows outward from its edge, so this is the clickable "empty box" ring.
+ */
+export function frontierCells(world: World): Cell[] {
+  const taken = occupiedKeys(world);
+  const out = new Map<string, Cell>();
+  for (const ca of world.order) {
+    for (const n of neighbors(world.hives[ca].cell)) {
+      const k = cellKey(n);
+      if (!taken.has(k) && !out.has(k)) out.set(k, n);
+    }
+  }
+  return [...out.values()];
+}
+
+/** True when `cell` is free and on the edge of the comb, i.e. a unit can be founded there. */
+export function isFoundable(world: World, cell: Cell) {
+  const taken = occupiedKeys(world);
+  if (taken.has(cellKey(cell))) return false;
+  return world.order.length === 0 || neighbors(cell).some((n) => taken.has(cellKey(n)));
+}
+
 /* ---------- founding a new unit (mock launch) ---------- */
-export function foundHive(world: World, input: { name: string; ticker: string; image: string; description?: string; devBuy: number; owner?: string }, now = Date.now()): Hive {
+export interface FoundInput {
+  name: string;
+  ticker: string;
+  image: string;
+  description?: string;
+  devBuy: number;
+  owner?: string;
+  /** Preferred empty cell. Used when it is still free and on the edge; otherwise the next free cell is taken. */
+  cell?: Cell | null;
+  look?: QueenLook;
+  rules?: Partial<QueenRules>;
+  motto?: string;
+  temperament?: { dip: string; swarm: string };
+}
+
+export function foundHive(world: World, input: FoundInput, now = Date.now()): Hive {
   const rng = mulberry32((now ^ 0xabcdef) >>> 0);
-  const taken = new Set(world.order.map((ca) => cellKey(world.hives[ca].cell)));
+  const taken = occupiedKeys(world);
   const cells = spiral(world.order.length + 40);
-  const cell: Cell = cells.find((c) => !taken.has(cellKey(c))) ?? { q: 0, r: 0 };
+  const wanted = input.cell && isFoundable(world, input.cell) ? { q: input.cell.q, r: input.cell.r } : null;
+  const cell: Cell = wanted ?? cells.find((c) => !taken.has(cellKey(c))) ?? { q: 0, r: 0 };
   const ca = mockAddress(rng);
   const price = 0.00000028;
   const h: Hive = {
@@ -505,6 +552,11 @@ export function foundHive(world: World, input: { name: string; ticker: string; i
     cell,
     vigor: 0.5,
     priceHistory: [{ time: Math.floor(now / 1000) - 1, value: price }],
+    look: input.look,
+    rules: input.rules ? clampRules(input.rules) : undefined,
+    description: input.description?.trim() || undefined,
+    motto: input.motto?.trim() || undefined,
+    temperament: input.temperament,
   };
   world.hives[ca] = h;
   world.order.push(ca);

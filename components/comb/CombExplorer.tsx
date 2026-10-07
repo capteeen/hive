@@ -1,18 +1,15 @@
 'use client';
 import dynamic from 'next/dynamic';
-import Link from 'next/link';
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import { useHive, selectHives } from '@/lib/store';
-import { useNow } from '@/lib/useNow';
-import { short, addrUrl } from '@/lib/format';
-import HexButton from '@/components/HexButton';
 import { theme } from '@/themes';
 import { feeGrowth } from '@/lib/sim';
 import { fmtNum, fmtSol } from '@/lib/format';
 import Avatar from '@/components/Avatar';
 import { StateBadge } from '@/components/Badges';
-import type { Hive, HiveState } from '@/lib/types';
+import { pickKey, type CombPick, type Hive, type HiveState } from '@/lib/types';
+import type { SafeArea } from '@/lib/comb3d';
 
 const CombScene = dynamic(() => import('@/components/comb/CombScene'), { ssr: false });
 
@@ -29,11 +26,47 @@ export default function CombExplorer() {
   const params = useSearchParams();
   const router = useRouter();
   const focusCa = params.get('focus') ?? undefined;
-  const mine = useHive((s) => s.mine);
-  const focusHive = focusCa ? hives.find((h) => h.ca === focusCa) : undefined;
-  const [dismissed, setDismissed] = useState(false);
-  const now = useNow(1000);
-  const justFounded = !!focusHive && mine.includes(focusHive.ca) && now !== null && now - focusHive.bornAt < 120000;
+  const [sel, setSel] = useState<CombPick>(focusCa ? { kind: 'hive', ca: focusCa } : null);
+  const colRef = useRef<HTMLDivElement>(null);
+  const headRef = useRef<HTMLDivElement>(null);
+  const [area, setArea] = useState<Partial<SafeArea>>({});
+
+  // a new ?focus= (e.g. after founding) selects that hive
+  useEffect(() => {
+    if (focusCa) setSel({ kind: 'hive', ca: focusCa });
+  }, [focusCa]);
+
+  // start with the list collapsed on phones so the comb is visible
+  useEffect(() => {
+    if (window.innerWidth < 768) setOpen(false);
+  }, []);
+
+  // tell the comb which part of the screen the list covers
+  useEffect(() => {
+    const measure = () => {
+      const col = colRef.current;
+      const head = headRef.current;
+      if (!col || !head) return;
+      if (window.innerWidth >= 768) setArea({ left: Math.round(col.getBoundingClientRect().right + 12), top: 72 });
+      else setArea({ top: Math.round(head.getBoundingClientRect().bottom + 8) });
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    if (colRef.current) ro.observe(colRef.current);
+    window.addEventListener('resize', measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [open]);
+
+  const onSel = useCallback(
+    (p: CombPick) => {
+      setSel(p);
+      if (!p && focusCa) router.replace('/comb', { scroll: false });
+    },
+    [focusCa, router],
+  );
 
   const filter = useMemo(() => {
     const query = q.trim().toLowerCase();
@@ -45,27 +78,24 @@ export default function CombExplorer() {
     return hives.filter(filter).sort((a, b) => key(b) - key(a));
   }, [hives, filter, sort]);
 
+  const selKey = pickKey(sel);
+
   return (
     <div className="relative h-[100svh] w-full overflow-hidden">
-      <CombScene
-        className="absolute inset-0 h-full w-full"
-        filter={filter}
-        focusCa={focusCa}
-        label={focusHive && !dismissed ? { ca: focusHive.ca, text: `${focusHive.name} · $${focusHive.ticker}` } : null}
-      />
+      <CombScene className="absolute inset-0 h-full w-full" filter={filter} focusCa={focusCa} selection={sel} onSelectionChange={onSel} safeArea={area} />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-night/80 to-transparent" />
-      <div className="absolute left-4 top-24 z-10 flex max-h-[calc(100svh-7rem)] w-[min(380px,calc(100vw-2rem))] flex-col sm:left-6 sm:top-28">
-        <div className="shape-card glass p-4">
+      <div ref={colRef} className="absolute left-4 top-24 z-10 flex max-h-[calc(100svh-7rem)] w-[min(380px,calc(100vw-2rem))] flex-col sm:left-6 sm:top-28">
+        <div ref={headRef} className="shape-card glass p-4">
           <div className="flex items-center justify-between">
             <h1 className="font-heading text-xl font-semibold tracking-tight">The {theme.scene}</h1>
-            <button onClick={() => setOpen(!open)} className="text-xs text-text/60 hover:text-text">
+            <button onClick={() => setOpen(!open)} className="text-xs text-text/60 hover:text-text" aria-expanded={open}>
               {open ? 'hide list' : 'show list'}
             </button>
           </div>
           <input value={q} onChange={(e) => setQ(e.target.value)} placeholder={`Search by CA, name or ticker`} className="mt-3 w-full bg-night/60 px-3 py-2 text-sm outline-none ring-1 ring-accent/25 focus:ring-accent/60" />
           <div className="mt-3 flex flex-wrap gap-1.5">
             {(['working', 'starving', 'abandoned'] as HiveState[]).map((s) => (
-              <button key={s} onClick={() => setStates({ ...states, [s]: !states[s] })} className={`shape-btn h-7 text-[11px] font-semibold uppercase tracking-wider ${states[s] ? 'btn-honey' : 'btn-ghost opacity-60'}`}>
+              <button key={s} onClick={() => setStates({ ...states, [s]: !states[s] })} data-sfx="toggle" aria-pressed={states[s]} className={`shape-btn h-7 text-[11px] font-semibold uppercase tracking-wider ${states[s] ? 'btn-honey' : 'btn-ghost opacity-60'}`}>
                 {s}
               </button>
             ))}
@@ -73,7 +103,7 @@ export default function CombExplorer() {
           <div className="mt-3 flex items-center gap-2 text-xs text-text/60">
             <span>sort</span>
             {(['honey', 'bees', 'growth'] as Sort[]).map((s) => (
-              <button key={s} onClick={() => setSort(s)} className={`${sort === s ? 'text-accent' : 'hover:text-text'}`}>
+              <button key={s} onClick={() => setSort(s)} aria-pressed={sort === s} className={`${sort === s ? 'text-accent' : 'hover:text-text'}`}>
                 {s === 'honey' ? theme.copy.resource : s === 'bees' ? theme.holderPlural : 'fee growth'}
               </button>
             ))}
@@ -82,71 +112,47 @@ export default function CombExplorer() {
         </div>
         {open && (
           <ol className="shape-card glass mt-3 flex-1 overflow-y-auto scroll-thin">
-            {list.map((h, i) => (
-              <li key={h.ca}>
-                <Link href={`/hive/${h.ca}`} className="flex items-center gap-3 px-4 py-2.5 transition-colors duration-600 hover:bg-accent/10">
-                  <span className="w-5 text-xs tabular-nums text-text/40">{i + 1}</span>
-                  <Avatar hive={h} size={28} />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-2">
-                      <span className="truncate font-heading text-sm font-semibold tracking-tight">{h.name}</span>
-                      {h.ca === biggest && <span className="shape-hex inline-block h-2 w-2 bg-royal" />}
+            {list.map((h, i) => {
+              const active = selKey === `h:${h.ca}`;
+              return (
+                <li key={h.ca}>
+                  <button
+                    onClick={() => {
+                      onSel({ kind: 'hive', ca: h.ca });
+                      if (window.innerWidth < 768) setOpen(false);
+                    }}
+                    data-sfx="select"
+                    aria-current={active ? 'true' : undefined}
+                    className={`flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors duration-600 hover:bg-accent/10 ${active ? 'bg-accent/15' : ''}`}
+                  >
+                    <span className="w-5 text-xs tabular-nums text-text/40">{i + 1}</span>
+                    <Avatar hive={h} size={28} />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <span className="truncate font-heading text-sm font-semibold tracking-tight">{h.name}</span>
+                        {h.ca === biggest && <span className="shape-hex inline-block h-2 w-2 bg-royal" />}
+                      </div>
+                      <div className="text-[11px] tabular-nums text-text/50">
+                        {fmtSol(h.honey, 1)} · {fmtNum(h.bees)} {theme.holderPlural}
+                      </div>
                     </div>
-                    <div className="text-[11px] tabular-nums text-text/50">
-                      {fmtSol(h.honey, 1)} · {fmtNum(h.bees)} {theme.holderPlural}
-                    </div>
-                  </div>
-                  <StateBadge state={h.state} />
-                </Link>
-              </li>
-            ))}
+                    <StateBadge state={h.state} />
+                  </button>
+                </li>
+              );
+            })}
             {!list.length && <li className="px-4 py-6 text-sm text-text/50">No {theme.unitPlural} match.</li>}
           </ol>
         )}
       </div>
-      {focusHive && !dismissed && (
-        <div className="shape-card glass fade-up absolute bottom-6 left-4 right-4 z-10 p-5 sm:left-auto sm:right-6 sm:w-[380px]">
-          <div className="flex items-start gap-3">
-            <Avatar hive={focusHive} size={44} />
-            <div className="min-w-0 flex-1">
-              <div className="text-[11px] uppercase tracking-[0.18em] text-accent">{justFounded ? `your ${theme.unit} is on the ${theme.scene}` : `on the ${theme.scene}`}</div>
-              <div className="mt-0.5 truncate font-heading text-lg font-semibold tracking-tight">
-                {focusHive.name} <span className="text-accent">${focusHive.ticker}</span>
-              </div>
-              <div className="mt-1 text-xs text-text/60">
-                {justFounded
-                  ? `The ${theme.agent} has her wallet. ${cap(theme.holderPlural)} are moving in. From now on she ${theme.verbs.burn}s, ${theme.verbs.store.split(' ')[0]}s and ${theme.verbs.interact}s with the fees.`
-                  : `${fmtSol(focusHive.honey, 2)} · ${fmtNum(focusHive.bees)} ${theme.holderPlural} · ${focusHive.state}`}
-              </div>
-              <div className="mt-2 flex items-center gap-2 text-[11px] text-text/50">
-                <span>{theme.agent} wallet</span>
-                <a href={addrUrl(focusHive.queenWallet)} target="_blank" rel="noreferrer" className="font-mono text-accent/80 hover:text-accent">
-                  {short(focusHive.queenWallet, 5)} ↗
-                </a>
-              </div>
-            </div>
-            <button
-              onClick={() => {
-                setDismissed(true);
-                router.replace('/comb');
-              }}
-              className="shape-hex flex h-8 w-8 shrink-0 items-center justify-center bg-accent/10 text-text/70 hover:bg-accent/20"
-              aria-label="Dismiss"
-            >
-              ×
-            </button>
-          </div>
-          <div className="mt-4 flex gap-2">
-            <HexButton size="sm" href={`/hive/${focusHive.ca}`}>
-              Open {theme.unit}
-            </HexButton>
-            <HexButton size="sm" variant="ghost" href="/leaderboard">
-              Leaderboard
-            </HexButton>
-          </div>
+      {!sel && (
+        <div className="pointer-events-none absolute bottom-6 right-6 hidden text-right text-[11px] uppercase tracking-[0.18em] text-text/40 sm:block">
+          Click a cell for details · click an empty <span className="text-accent/70">+</span> cell to found a {theme.unit}
+          <br />
+          {cap(theme.holderPlural)} capped at 30 per cell · hover for the real count
         </div>
       )}
-      <div className="pointer-events-none absolute bottom-6 right-6 hidden text-[11px] uppercase tracking-[0.18em] text-text/40 sm:block">{cap(theme.holderPlural)} capped at 30 per cell · hover for real count</div>
     </div>
   );
 }
+

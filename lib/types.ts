@@ -1,3 +1,5 @@
+import type { QueenLook, QueenRules } from './queen';
+
 export type HiveState = 'working' | 'starving' | 'abandoned';
 export type ActionVerb = 'seal' | 'store' | 'swarm' | 'starve' | 'abandon' | 'jelly' | 'born';
 
@@ -5,6 +7,11 @@ export interface Cell {
   q: number;
   r: number;
 }
+
+/** What the user is pointing at or has selected on the comb: a hive, an empty cell, or nothing. */
+export type CombPick = { kind: 'hive'; ca: string } | { kind: 'empty'; q: number; r: number } | null;
+
+export const pickKey = (p: CombPick) => (!p ? '' : p.kind === 'hive' ? `h:${p.ca}` : `e:${p.q},${p.r}`);
 
 export interface Hive {
   ca: string;
@@ -34,6 +41,12 @@ export interface Hive {
   /** mock: holders the hive had before starving started (for decay display). */
   beesPeak: number;
   priceHistory: PricePoint[];
+  /** Set for hives founded through the wizard. */
+  look?: QueenLook;
+  rules?: QueenRules;
+  description?: string;
+  motto?: string;
+  temperament?: { dip: string; swarm: string };
 }
 
 export interface PricePoint {

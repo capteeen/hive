@@ -13,9 +13,9 @@ export default function HarvestCountdown({ compact = false, className = '' }: { 
   const text = now === null ? '--:--' : countdown(left);
   if (compact) {
     return (
-      <div className={`flex items-center gap-2 ${className}`} title={`Next ${theme.hubRitual} (UTC, hourly)`}>
+      <div className={`flex shrink-0 items-center gap-2 ${className}`} title={`Next ${theme.hubRitual} (UTC, hourly)`}>
         <span className={`relative inline-block h-2 w-2 shape-hex ${hot ? 'bg-royal' : 'bg-accent'} pulse-ring`} />
-        <span className="text-[11px] uppercase tracking-wider text-text/60">{theme.copy.stats.next}</span>
+        <span className="hidden whitespace-nowrap text-[11px] uppercase tracking-wider text-text/60 sm:inline">{theme.copy.stats.next}</span>
         <PourCounter value={text} className={`text-sm font-semibold ${hot ? 'text-royal' : 'text-accent'}`} />
       </div>
     );

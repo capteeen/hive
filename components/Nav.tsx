@@ -5,11 +5,13 @@ import dynamic from 'next/dynamic';
 import { theme } from '@/themes';
 import { useHive } from '@/lib/store';
 import { useUI } from '@/lib/ui';
+import { installClickSounds } from '@/lib/sfx';
+import { useEffect } from 'react';
 import HexButton from './HexButton';
 import HarvestCountdown from './HarvestCountdown';
 
 const WalletButton = dynamic(() => import('./WalletButton'), { ssr: false });
-const LaunchModal = dynamic(() => import('./LaunchModal'), { ssr: false });
+const LaunchWizard = dynamic(() => import('./launch/LaunchWizard'), { ssr: false });
 const Hum = dynamic(() => import('./Hum'), { ssr: false });
 
 const links = [
@@ -30,6 +32,9 @@ export default function Nav() {
   const sound = useHive((s) => s.sound);
   const toggleSound = useHive((s) => s.toggleSound);
   const openLaunch = useUI((s) => s.openLaunch);
+  const fx = useHive((s) => s.sfx);
+  const toggleSfx = useHive((s) => s.toggleSfx);
+  useEffect(() => installClickSounds(), []);
   return (
     <>
       <header className="fixed inset-x-0 top-0 z-40 border-b border-accent/10 bg-night/60 backdrop-blur-xl">
@@ -55,16 +60,26 @@ export default function Nav() {
             >
               <span className={`shape-hex inline-block h-2 w-2 ${sound ? 'bg-accent' : 'bg-text/30'}`} /> hum
             </button>
+            <button
+              onClick={toggleSfx}
+              data-sfx="toggle"
+              className="shape-btn btn-ghost inline-flex h-9 items-center text-xs"
+              aria-pressed={fx}
+              aria-label={fx ? 'Click sounds on' : 'Click sounds off'}
+              title={fx ? 'Click sounds on' : 'Click sounds off'}
+            >
+              <SpeakerIcon on={fx} />
+            </button>
             <button onClick={toggleMode} className="shape-btn btn-ghost hidden h-9 items-center text-xs sm:inline-flex" aria-label="Toggle daylight mode">
               {mode === 'night' ? 'Daylight' : 'Night'}
             </button>
             <span className="hidden sm:inline-flex">
               <WalletButton />
             </span>
-            <HexButton size="sm" onClick={openLaunch} className="hidden sm:inline-flex">
+            <HexButton size="sm" onClick={() => openLaunch()} className="hidden sm:inline-flex" data-sfx="open">
               Launch a {theme.unit}
             </HexButton>
-            <HexButton size="sm" onClick={openLaunch} className="sm:hidden">
+            <HexButton size="sm" onClick={() => openLaunch()} className="sm:hidden" data-sfx="open">
               Launch
             </HexButton>
           </div>
@@ -83,8 +98,27 @@ export default function Nav() {
           </span>
         </nav>
       </header>
-      <LaunchModal />
+      <LaunchWizard />
       <Hum />
     </>
+  );
+}
+
+function SpeakerIcon({ on }: { on: boolean }) {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+      <path d="M11 5 6 9H3v6h3l5 4V5z" fill="currentColor" stroke="none" />
+      {on ? (
+        <>
+          <path d="M15.5 8.5a5 5 0 0 1 0 7" />
+          <path d="M18.5 5.5a9 9 0 0 1 0 13" />
+        </>
+      ) : (
+        <>
+          <path d="m16 9 6 6" />
+          <path d="m22 9-6 6" />
+        </>
+      )}
+    </svg>
   );
 }

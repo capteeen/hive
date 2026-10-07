@@ -9,14 +9,27 @@ import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
 import { UnrealBloomPass } from 'three/examples/jsm/postprocessing/UnrealBloomPass.js';
 import { OutputPass } from 'three/examples/jsm/postprocessing/OutputPass.js';
-import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { theme } from '@/themes';
 import { axialToXY, ringXY, spiral, cellKey } from './hex';
-import type { Hive, SceneEvent } from './types';
+import { beeGeometry, wingGeometry, QueenModel } from './beeModel';
+import { pickKey, type Cell, type CombPick, type Hive, type SceneEvent } from './types';
+
+export type { CombPick } from './types';
+export { pickKey } from './types';
+
+/** Screen-space insets (px) covered by UI. Camera moves keep picked cells inside the rest. */
+export interface SafeArea {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
 
 const MAX_CELLS = 400;
 const MAX_BEES = 3200;
 const MAX_RINGS = 96;
+const MAX_SLOTS = 400;
+const MAX_GHOSTS = 4;
 const MAX_BEES_PER_CELL = 30;
 const TILT = (30 * Math.PI) / 180; // from vertical
 const CELL_R = 1;
@@ -60,6 +73,17 @@ interface Flight {
   done: boolean;
 }
 
+/** An empty cell on the edge of the comb where a new unit can be founded. */
+interface Slot {
+  q: number;
+  r: number;
+  key: string;
+  pos: THREE.Vector3;
+  born: number;
+  hover: number;
+  sel: number;
+}
+
 interface Ring {
   pos: THREE.Vector3;
   start: number;
@@ -86,7 +110,6 @@ interface CellVis {
   cap: number;
   targetCap: number;
   lift: number;
-  targetLift: number;
   flash: number; // red raid glow
   white: number; // harvest flash (biggest)
   pulse: number; // harvest wave glow
@@ -104,9 +127,19 @@ interface CellVis {
 
 export interface CombOptions {
   mode: 'comb' | 'single';
-  onHover?: (ca: string | null, x: number, y: number) => void;
-  onSelect?: (ca: string) => void;
   interactive?: boolean;
+  /** Fired when the thing under the pointer changes (not every frame). */
+  onHover?: (p: CombPick) => void;
+  /** A click (not a drag) on a hive, an empty cell, or the background (null). */
+  onSelect?: (p: CombPick) => void;
+  /** Double-click on a hive. */
+  onOpen?: (ca: string) => void;
+  /** 'always': plain wheel zooms (full-screen comb). 'modifier': only ctrl/⌘ + wheel or a trackpad pinch zooms, so the page still scrolls. */
+  wheelZoom?: 'always' | 'modifier';
+  /** Called when the wheel was ignored because no modifier was held. */
+  onWheelHint?: () => void;
+  /** Let vertical one-finger swipes scroll the page instead of panning (home hero). */
+  touchScroll?: boolean;
 }
 
 const _m = new THREE.Matrix4();
@@ -116,6 +149,8 @@ const _s = new THREE.Vector3();
 const _e = new THREE.Euler();
 const _c = new THREE.Color();
 const _v = new THREE.Vector3();
+const _dir = new THREE.Vector3();
+const _ndc = new THREE.Vector2();
 
 const smooth = (a: number, b: number, x: number) => {
   const u = THREE.MathUtils.clamp((x - a) / (b - a), 0, 1);
@@ -149,70 +184,6 @@ function prismGeometry(r: number, hole?: number) {
   return g;
 }
 
-/* ---------- the bee ---------- */
-function paint(g: THREE.BufferGeometry, fn: (x: number, y: number, z: number) => THREE.Color) {
-  const pos = g.attributes.position;
-  const arr = new Float32Array(pos.count * 3);
-  for (let i = 0; i < pos.count; i++) {
-    const c = fn(pos.getX(i), pos.getY(i), pos.getZ(i));
-    arr[i * 3] = c.r;
-    arr[i * 3 + 1] = c.g;
-    arr[i * 3 + 2] = c.b;
-  }
-  g.setAttribute('color', new THREE.BufferAttribute(arr, 3));
-  g.deleteAttribute('uv');
-  return g;
-}
-
-/** Striped abdomen, fuzzy golden thorax, dark head. Forward is +Z. Length ≈ 0.31 units. */
-function beeGeometry() {
-  const dark = new THREE.Color('#1c1207');
-  const amber = new THREE.Color(theme.palette.accent);
-  const gold = new THREE.Color(theme.palette.accentSoft);
-  const fuzz = gold.clone().lerp(dark, 0.15);
-
-  const abdomen = new THREE.SphereGeometry(1, 16, 12);
-  paint(abdomen, (_x, y, z) => {
-    const s = (z + 1) / 2; // 0 = tail, 1 = front
-    if (s < 0.14) return dark;
-    const band = Math.floor(s * 5.4) % 2 === 0;
-    const c = (band ? dark : amber).clone();
-    if (y > 0.3) c.lerp(gold, band ? 0.1 : 0.25); // lit top
-    return c;
-  });
-  abdomen.scale(0.072, 0.064, 0.105);
-  abdomen.translate(0, 0, -0.058);
-
-  const thorax = new THREE.SphereGeometry(1, 14, 10);
-  paint(thorax, (_x, y) => (y > 0.2 ? gold.clone().lerp(new THREE.Color('#ffffff'), 0.12) : fuzz));
-  thorax.scale(0.064, 0.06, 0.072);
-  thorax.translate(0, 0.004, 0.052);
-
-  const head = new THREE.SphereGeometry(1, 12, 8);
-  paint(head, () => dark);
-  head.scale(0.04, 0.04, 0.038);
-  head.translate(0, 0.012, 0.118);
-
-  return mergeGeometries([abdomen, thorax, head])!;
-}
-
-/** Four translucent wings: fore + hind on each side, swept back, lying nearly flat. */
-function wingGeometry() {
-  const mk = (side: number, len: number, wid: number, dx: number, dz: number, sweep: number) => {
-    const g = new THREE.CircleGeometry(1, 12);
-    g.scale(len, wid, 1);
-    g.translate(len * 0.85, 0, 0); // hinge at the body
-    g.rotateX(-Math.PI / 2);
-    g.rotateY(-side * sweep);
-    if (side < 0) g.scale(-1, 1, 1);
-    g.translate(0, 0.056, dz + dx * 0);
-    return g;
-  };
-  const parts = [mk(1, 0.125, 0.048, 0, 0.012, 0.5), mk(-1, 0.125, 0.048, 0, 0.012, 0.5), mk(1, 0.085, 0.034, 0, -0.03, 0.95), mk(-1, 0.085, 0.034, 0, -0.03, 0.95)];
-  for (const p of parts) p.deleteAttribute('uv');
-  return mergeGeometries(parts)!;
-}
-
 function shadowGeometry() {
   const g = new THREE.CircleGeometry(0.11, 12);
   g.rotateX(-Math.PI / 2);
@@ -223,13 +194,13 @@ function shadowGeometry() {
 const spiralIndex = new Map<string, number>();
 spiral(600).forEach((c, i) => spiralIndex.set(cellKey(c), i));
 
-function layoutXZ(h: Hive): [number, number] {
+function layoutXZ(cell: Cell): [number, number] {
   if (theme.scene === 'den') {
-    const i = spiralIndex.get(cellKey(h.cell)) ?? 0;
+    const i = spiralIndex.get(cellKey(cell)) ?? 0;
     const [x, y] = ringXY(i, 2.25);
     return [x, y];
   }
-  const [x, y] = axialToXY(h.cell, CELL_R * CELL_GAP);
+  const [x, y] = axialToXY(cell, CELL_R * CELL_GAP);
   return [x, y];
 }
 
@@ -250,6 +221,25 @@ export class CombRenderer {
   private beeMesh: THREE.InstancedMesh;
   private wingMesh: THREE.InstancedMesh;
   private shadowMesh: THREE.InstancedMesh;
+  private slotPlate: THREE.InstancedMesh;
+  private slotRim: THREE.InstancedMesh;
+  private ghostMesh: THREE.InstancedMesh;
+  private selRing: THREE.Mesh<THREE.BufferGeometry, THREE.MeshBasicMaterial>;
+  private slots: Slot[] = [];
+  private slotByKey = new Map<string, Slot>();
+  private scouts: Bee[] = [];
+  private customQueens = new Map<string, QueenModel>();
+  private hoverPick: CombPick = null;
+  private selPick: CombPick = null;
+  private safe: SafeArea = { left: 0, top: 0, right: 0, bottom: 0 };
+  private tmpCam: THREE.OrthographicCamera;
+  private plane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+  private pointerInside = false;
+  private pointerDirty = false;
+  private frame = 0;
+  private down: { x: number; y: number; id: number; grab: THREE.Vector3 | null; moved: boolean } | null = null;
+  private lastClick = { key: '', time: 0 };
+  private day = false;
   private ringMesh: THREE.InstancedMesh;
   private pulseMesh: THREE.InstancedMesh;
   private rings: Ring[] = [];
@@ -264,12 +254,8 @@ export class CombRenderer {
   private raf = 0;
   private last = 0;
   private time = 0;
-  private hovered: CellVis | null = null;
   private pointer = new THREE.Vector2(-10, -10);
   private raycaster = new THREE.Raycaster();
-  private dragging = false;
-  private dragMoved = false;
-  private lastPointer = { x: 0, y: 0 };
   private pinch = 0;
   private width = 1;
   private height = 1;
@@ -307,6 +293,7 @@ export class CombRenderer {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
 
     this.camera = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 400);
+    this.tmpCam = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 400);
     this.zoom = 1;
     this.zoomGoal = 1;
 
@@ -396,6 +383,40 @@ export class CombRenderer {
     this.shadowMesh.frustumCulled = false;
     this.scene.add(this.shadowMesh);
 
+    // empty cells: a shallow socket (plate + rim) at ground level, a translucent wax "ghost"
+    // cell that rises over the hovered / selected one, and a glowing rim around the selection
+    this.slotPlate = new THREE.InstancedMesh(prismGeometry(CELL_R * 0.97), new THREE.MeshBasicMaterial({ color: 0xffffff }), MAX_SLOTS);
+    this.slotPlate.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.slotPlate.count = 0;
+    this.scene.add(this.slotPlate);
+    this.slotRim = new THREE.InstancedMesh(prismGeometry(CELL_R, CELL_R * 0.9), new THREE.MeshBasicMaterial({ color: 0xffffff }), MAX_SLOTS);
+    this.slotRim.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.slotRim.count = 0;
+    this.scene.add(this.slotRim);
+    const ghostMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(theme.palette.accentSoft),
+      transparent: true,
+      opacity: 0.38,
+      roughness: 0.35,
+      metalness: 0.05,
+      emissive: new THREE.Color(theme.palette.accent),
+      emissiveIntensity: 0.35,
+      depthWrite: false,
+    });
+    this.ghostMesh = new THREE.InstancedMesh(wallGeo, ghostMat, MAX_GHOSTS);
+    this.ghostMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.ghostMesh.count = 0;
+    this.scene.add(this.ghostMesh);
+    this.selRing = new THREE.Mesh(
+      prismGeometry(CELL_R * 1.13, CELL_R * 0.99),
+      new THREE.MeshBasicMaterial({ color: new THREE.Color(theme.palette.accentSoft), transparent: true, opacity: 0.6, blending: THREE.AdditiveBlending, depthWrite: false }),
+    );
+    this.selRing.visible = false;
+    this.scene.add(this.selRing);
+
+    // Instanced meshes move every frame: never frustum-cull them on a stale bounding sphere.
+    for (const m of [this.wallMesh, this.floorMesh, this.liquidMesh, this.capMesh, this.slotPlate, this.slotRim, this.ghostMesh]) m.frustumCulled = false;
+
     const ringGeo = new THREE.RingGeometry(0.86, 1, 48);
     ringGeo.rotateX(-Math.PI / 2);
     const ringMat = new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.8, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide });
@@ -423,8 +444,6 @@ export class CombRenderer {
 
     if (typeof window !== 'undefined') (window as unknown as { __comb?: CombRenderer }).__comb = this;
     this.resize();
-    if (opts.mode === 'comb' && this.width > 1000) this.target.set(-3.2, 0, 0.4);
-    else if (opts.mode === 'comb' && this.width < 760) this.target.set(0, 0, 5);
     this.goal.copy(this.target);
     this.bind();
     this.last = performance.now();
@@ -438,6 +457,7 @@ export class CombRenderer {
     (this.scene.background as THREE.Color).set(hex);
     this.ground.material.color.set(day ? theme.palette.dayBase : theme.palette.surface).multiplyScalar(day ? 0.92 : 1);
     this.renderer.toneMappingExposure = day ? 1.25 : 1.05;
+    this.day = day;
   }
 
   setVisible(v: boolean) {
@@ -452,7 +472,7 @@ export class CombRenderer {
     for (const h of list) {
       seen.add(h.ca);
       let c = this.byCa.get(h.ca);
-      const [x, z] = this.opts.mode === 'single' ? [0, 0] : layoutXZ(h);
+      const [x, z] = this.opts.mode === 'single' ? [0, 0] : layoutXZ(h.cell);
       if (!c) {
         c = this.createCell(h, x, z);
         this.cells.push(c);
@@ -486,6 +506,7 @@ export class CombRenderer {
     this.cells = this.cells.filter((c) => {
       if (seen.has(c.ca)) return true;
       this.byCa.delete(c.ca);
+      this.dropQueen(c.ca);
       return false;
     });
   }
@@ -562,31 +583,107 @@ export class CombRenderer {
     this.flights.push({ from, to, start: this.time + 0.6, dur: 2.6, bees, targetCa: c.ca, kind: 'found', done: false });
   }
 
-  /** Smoothly pan and zoom the camera to a cell. */
-  flyTo(ca: string, zoom = 1.9) {
-    const c = this.byCa.get(ca);
-    if (!c || this.opts.mode !== 'comb') return;
-    this.goal.copy(c.target);
-    // keep the cell clear of the side panel on wide screens
-    const halfW = (this.camera.right / zoom) * 1;
-    if (this.width > 1000) this.goal.x -= halfW * 0.28;
-    this.zoomGoal = zoom;
+  /** The empty cells to draw as clickable sockets (the comb's growth edge). */
+  setEmpties(cells: Cell[]) {
+    if (this.opts.mode !== 'comb') return;
+    const keep = new Set<string>();
+    for (const c of cells) {
+      const key = cellKey(c);
+      keep.add(key);
+      if (this.slotByKey.has(key)) continue;
+      const [x, z] = layoutXZ(c);
+      const slot: Slot = { q: c.q, r: c.r, key, pos: new THREE.Vector3(x, 0, z), born: this.time, hover: 0, sel: 0 };
+      this.slots.push(slot);
+      this.slotByKey.set(key, slot);
+    }
+    this.slots = this.slots.filter((sl) => {
+      if (keep.has(sl.key)) return true;
+      this.slotByKey.delete(sl.key);
+      return false;
+    });
+  }
+
+  /** Highlight a hive (lift + glowing rim) or an empty cell (ghost cell + scouts), or clear. */
+  select(p: CombPick) {
+    const was = pickKey(this.selPick);
+    this.selPick = p;
+    if (pickKey(p) === was) return;
+    this.scouts = [];
+    if (p?.kind === 'empty') {
+      for (let i = 0; i < 3; i++) this.scouts.push(this.makeBee());
+      const sl = this.slotByKey.get(`${p.q},${p.r}`);
+      if (sl) this.spawnRing(sl.pos, 0.3, 1.4, 0.9, this.palette.soft, 0.06);
+    }
+  }
+
+  /** Screen insets covered by UI. With `recenter`, snaps the comb's centre into the visible area. */
+  setSafeArea(a: SafeArea, recenter = false) {
+    this.safe = { ...a };
+    if (recenter && this.opts.mode === 'comb') {
+      const g = this.goalFor(_v.set(0, 0, 0), this.zoom);
+      this.target.copy(g);
+      this.goal.copy(g);
+      this.flying = false;
+    }
+  }
+
+  /** Smoothly pan (and optionally zoom) so the pick sits in the middle of the safe area. */
+  flyToPick(p: CombPick, zoom?: number) {
+    if (this.opts.mode !== 'comb') return;
+    const pos = this.pickPos(p);
+    if (!pos) return;
+    this.zoomGoal = THREE.MathUtils.clamp(zoom ?? this.zoom, 0.45, 4);
+    this.goal.copy(this.goalFor(pos, this.zoomGoal));
     this.flying = true;
   }
 
-  /** Screen position (px, relative to the canvas) of a cell's rim, or null if unknown. */
+  flyTo(ca: string, zoom?: number) {
+    this.flyToPick({ kind: 'hive', ca }, zoom);
+  }
+
+  /** Pan only if the pick is off-screen or hidden under UI. Keeps the cell under the cursor otherwise. */
+  ensureVisible(p: CombPick) {
+    const s = this.projectPick(p);
+    if (!s) return;
+    const r = this.safeRect();
+    const m = 48;
+    if (s.x < r.left + m || s.x > r.right - m || s.y < r.top + m || s.y > r.bottom - m) this.flyToPick(p);
+  }
+
+  /** Screen position (px, relative to the canvas) just above a cell's rim, or null if unknown. */
   project(ca: string): { x: number; y: number } | null {
-    const c = this.byCa.get(ca);
-    if (!c) return null;
-    _v.set(c.pos.x, c.height + 0.35, c.pos.z).project(this.camera);
+    return this.projectPick({ kind: 'hive', ca });
+  }
+
+  projectPick(p: CombPick): { x: number; y: number } | null {
+    if (!p) return null;
+    if (p.kind === 'hive') {
+      const c = this.byCa.get(p.ca);
+      if (!c) return null;
+      _v.set(c.pos.x, c.lift * 0.08 + c.height + 0.95, c.pos.z);
+    } else {
+      const sl = this.slotByKey.get(`${p.q},${p.r}`);
+      if (!sl) return null;
+      _v.set(sl.pos.x, 0.9, sl.pos.z);
+    }
+    _v.project(this.camera);
     return { x: ((_v.x + 1) / 2) * this.width, y: ((1 - _v.y) / 2) * this.height };
   }
 
-  focus(ca: string) {
-    this.flyTo(ca, this.zoom);
+  getZoom() {
+    return this.zoom;
+  }
+
+  private dropQueen(ca: string) {
+    const q = this.customQueens.get(ca);
+    if (!q) return;
+    this.scene.remove(q.group);
+    q.dispose();
+    this.customQueens.delete(ca);
   }
 
   dispose() {
+    for (const ca of [...this.customQueens.keys()]) this.dropQueen(ca);
     this.disposed = true;
     cancelAnimationFrame(this.raf);
     this.unbind();
@@ -595,6 +692,80 @@ export class CombRenderer {
   }
 
   /* ---------- internals ---------- */
+  private pickPos(p: CombPick): THREE.Vector3 | null {
+    if (!p) return null;
+    if (p.kind === 'hive') return this.byCa.get(p.ca)?.target.clone() ?? null;
+    const sl = this.slotByKey.get(`${p.q},${p.r}`);
+    if (sl) return sl.pos.clone();
+    const [x, z] = layoutXZ({ q: p.q, r: p.r });
+    return new THREE.Vector3(x, 0, z);
+  }
+
+  /** The visible rectangle (px) once UI insets are removed; falls back to the full canvas if too small. */
+  private safeRect() {
+    let { left, top, right, bottom } = this.safe;
+    if (this.width - left - right < 160) left = right = 0;
+    if (this.height - top - bottom < 140) top = bottom = 0;
+    return { left, top, right: this.width - right, bottom: this.height - bottom };
+  }
+
+  private placeCamera(cam: THREE.OrthographicCamera, target: THREE.Vector3, zoom: number) {
+    _dir.set(Math.sin(this.azimuth) * Math.sin(TILT), Math.cos(TILT), Math.cos(this.azimuth) * Math.sin(TILT));
+    cam.position.copy(target).addScaledVector(_dir, 80);
+    cam.up.set(0, 1, 0);
+    cam.lookAt(target);
+    cam.zoom = zoom;
+    cam.updateProjectionMatrix();
+    cam.updateMatrixWorld();
+  }
+
+  /** Where the ray through `ndc` meets the plane y = `y`. */
+  private groundAt(ndc: THREE.Vector2, cam: THREE.Camera = this.camera, y = 0): THREE.Vector3 | null {
+    this.raycaster.setFromCamera(ndc, cam);
+    this.plane.constant = -y;
+    return this.raycaster.ray.intersectPlane(this.plane, new THREE.Vector3());
+  }
+
+  /** The camera target that puts world point `pos` at the centre of the safe area at `zoom`. */
+  private goalFor(pos: THREE.Vector3, zoom: number) {
+    const base = new THREE.Vector3(pos.x, 0, pos.z);
+    this.placeCamera(this.tmpCam, base, zoom);
+    const r = this.safeRect();
+    const sx = ((r.left + r.right) / 2 / this.width) * 2 - 1;
+    const sy = -(((r.top + r.bottom) / 2 / this.height) * 2 - 1);
+    const gC = this.groundAt(_ndc.set(0, 0), this.tmpCam);
+    const gS = this.groundAt(_ndc.set(sx, sy), this.tmpCam);
+    if (gC && gS) base.add(gC.sub(gS));
+    return base;
+  }
+
+  private ndcFromClient(x: number, y: number, out: THREE.Vector2) {
+    const rect = this.canvas.getBoundingClientRect();
+    return out.set(((x - rect.left) / rect.width) * 2 - 1, -((y - rect.top) / rect.height) * 2 + 1);
+  }
+
+  /** What is under the given NDC point: the nearest hive cell or empty socket. */
+  private pickNdc(ndc: THREE.Vector2): CombPick {
+    if (this.opts.mode !== 'comb') return null;
+    this.raycaster.setFromCamera(ndc, this.camera);
+    const hits = this.raycaster.intersectObjects([this.wallMesh, this.liquidMesh, this.slotPlate], false);
+    for (const h of hits) {
+      if (h.instanceId === undefined) continue;
+      if (h.object === this.slotPlate) {
+        const sl = this.slots[h.instanceId];
+        if (sl) return { kind: 'empty', q: sl.q, r: sl.r };
+      } else {
+        const c = this.cells[h.instanceId];
+        if (c) return { kind: 'hive', ca: c.ca };
+      }
+    }
+    return null;
+  }
+
+  private interactive() {
+    return this.opts.mode === 'comb' && this.opts.interactive !== false;
+  }
+
   private heightFor(h: Hive) {
     if (this.opts.mode === 'single') return 1.2;
     const t = Math.min(1, Math.log10(h.bees + 1) / 3.6);
@@ -622,7 +793,6 @@ export class CombRenderer {
       cap: h.sealed,
       targetCap: h.sealed,
       lift: 0,
-      targetLift: 0,
       flash: 0,
       white: 0,
       pulse: 0,
@@ -705,76 +875,128 @@ export class CombRenderer {
     this.composer.setSize(w, h);
     const aspect = w / h;
     const view = this.opts.mode === 'single' ? 1.9 : this.width < 760 ? 15 : 12;
-    this.camera.left = -view * aspect;
-    this.camera.right = view * aspect;
-    this.camera.top = view;
-    this.camera.bottom = -view;
-    this.camera.updateProjectionMatrix();
+    for (const cam of [this.camera, this.tmpCam]) {
+      cam.left = -view * aspect;
+      cam.right = view * aspect;
+      cam.top = view;
+      cam.bottom = -view;
+      cam.updateProjectionMatrix();
+    }
   }
 
   private updateCamera() {
-    const dist = 80;
-    const dir = new THREE.Vector3(Math.sin(this.azimuth) * Math.sin(TILT), Math.cos(TILT), Math.cos(this.azimuth) * Math.sin(TILT));
-    this.camera.position.copy(this.target).addScaledVector(dir, dist);
-    this.camera.up.set(0, 1, 0);
-    this.camera.lookAt(this.target);
-    this.camera.zoom = this.zoom;
-    this.camera.updateProjectionMatrix();
+    this.placeCamera(this.camera, this.target, this.zoom);
   }
 
   /* ---------- input ---------- */
   private onPointerMove = (e: PointerEvent) => {
-    const rect = this.canvas.getBoundingClientRect();
-    this.pointer.set(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
-    this.lastPointer.x = e.clientX;
-    this.lastPointer.y = e.clientY;
-    if (this.dragging && this.opts.interactive !== false && this.opts.mode === 'comb') {
-      const dx = e.movementX;
-      const dy = e.movementY;
-      if (Math.abs(dx) + Math.abs(dy) > 1) this.dragMoved = true;
-      this.flying = false;
-      const unitsPerPx = (this.camera.right - this.camera.left) / this.zoom / this.width;
-      const right = new THREE.Vector3(Math.cos(this.azimuth), 0, -Math.sin(this.azimuth));
-      const up = new THREE.Vector3(-Math.sin(this.azimuth), 0, -Math.cos(this.azimuth));
-      this.target.addScaledVector(right, -dx * unitsPerPx).addScaledVector(up, (-dy * unitsPerPx) / Math.cos(TILT));
+    this.ndcFromClient(e.clientX, e.clientY, this.pointer);
+    this.pointerInside = true;
+    this.pointerDirty = true;
+    const d = this.down;
+    if (!d || d.id !== e.pointerId || !this.interactive()) return;
+    if (!d.moved && Math.hypot(e.clientX - d.x, e.clientY - d.y) > 5) {
+      d.moved = true;
+      if (this.hoverPick) {
+        this.hoverPick = null;
+        this.opts.onHover?.(null);
+      }
+    }
+    if (d.moved && d.grab) {
+      // grab-pan: keep the ground point that was under the pointer at pointerdown under it now
+      const now = this.groundAt(this.pointer);
+      if (now) {
+        this.target.add(d.grab.clone().sub(now));
+        this.goal.copy(this.target);
+        this.flying = false;
+        this.updateCamera();
+      }
       this.canvas.style.cursor = 'grabbing';
     }
   };
   private onPointerDown = (e: PointerEvent) => {
-    this.dragging = true;
-    this.dragMoved = false;
-    this.canvas.setPointerCapture?.(e.pointerId);
+    if (!this.interactive()) return;
+    if (e.pointerType === 'mouse' && e.button !== 0) return;
+    this.ndcFromClient(e.clientX, e.clientY, this.pointer);
+    this.pointerInside = true;
+    this.pointerDirty = true;
+    this.down = { x: e.clientX, y: e.clientY, id: e.pointerId, grab: this.groundAt(this.pointer), moved: false };
+    if (e.pointerType === 'mouse') this.canvas.setPointerCapture?.(e.pointerId);
   };
   private onPointerUp = (e: PointerEvent) => {
-    this.dragging = false;
-    this.canvas.style.cursor = this.hovered ? 'pointer' : 'grab';
-    if (!this.dragMoved && this.hovered && this.opts.onSelect) this.opts.onSelect(this.hovered.ca);
-    this.canvas.releasePointerCapture?.(e.pointerId);
+    const d = this.down;
+    this.down = null;
+    if (this.canvas.hasPointerCapture?.(e.pointerId)) this.canvas.releasePointerCapture(e.pointerId);
+    if (!d || d.id !== e.pointerId || !this.interactive()) return;
+    if (d.moved) {
+      this.canvas.style.cursor = this.hoverPick ? 'pointer' : 'grab';
+      return;
+    }
+    // pick at the release point (touch has no hover, so never rely on the hover state)
+    const p = this.pickNdc(this.ndcFromClient(e.clientX, e.clientY, _ndc));
+    const key = pickKey(p);
+    const now = performance.now();
+    if (p?.kind === 'hive' && this.lastClick.key === key && now - this.lastClick.time < 380) {
+      this.lastClick = { key: '', time: 0 };
+      this.opts.onOpen?.(p.ca);
+      return;
+    }
+    this.lastClick = { key, time: now };
+    this.opts.onSelect?.(p);
+  };
+  private onPointerCancel = () => {
+    this.down = null;
   };
   private onPointerLeave = () => {
+    this.pointerInside = false;
     this.pointer.set(-10, -10);
-    this.dragging = false;
+    if (this.hoverPick) {
+      this.hoverPick = null;
+      this.opts.onHover?.(null);
+    }
+    if (!this.down) this.canvas.style.cursor = this.interactive() ? 'grab' : 'default';
   };
-  private onWheel = (e: WheelEvent) => {
-    if (this.opts.mode !== 'comb' || this.opts.interactive === false) return;
-    e.preventDefault();
+  private zoomAt(clientX: number, clientY: number, factor: number) {
+    const ndc = this.ndcFromClient(clientX, clientY, new THREE.Vector2());
+    const before = this.groundAt(ndc);
+    this.zoom = THREE.MathUtils.clamp(this.zoom * factor, 0.45, 4);
+    this.zoomGoal = this.zoom;
     this.flying = false;
-    const f = Math.exp(-e.deltaY * 0.0012);
-    this.zoom = THREE.MathUtils.clamp(this.zoom * f, 0.45, 4);
+    this.updateCamera();
+    const after = this.groundAt(ndc);
+    if (before && after) {
+      this.target.add(before.sub(after));
+      this.goal.copy(this.target);
+      this.updateCamera();
+    }
+  }
+  private onWheel = (e: WheelEvent) => {
+    if (!this.interactive()) return;
+    if (this.opts.wheelZoom === 'modifier' && !e.ctrlKey && !e.metaKey) {
+      this.opts.onWheelHint?.();
+      return; // let the page scroll
+    }
+    e.preventDefault();
+    this.zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * (e.ctrlKey ? 0.01 : 0.0012)));
   };
   private onTouchStart = (e: TouchEvent) => {
     if (e.touches.length === 2) {
+      this.down = null; // a pinch is not a pan or a tap
       this.pinch = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
     }
   };
   private onTouchMove = (e: TouchEvent) => {
-    if (e.touches.length === 2 && this.pinch) {
+    if (e.touches.length === 2 && this.pinch && this.interactive()) {
       e.preventDefault();
-      this.flying = false;
       const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
-      this.zoom = THREE.MathUtils.clamp(this.zoom * (d / this.pinch), 0.45, 4);
+      const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+      this.zoomAt(mx, my, d / this.pinch);
       this.pinch = d;
     }
+  };
+  private onTouchEnd = (e: TouchEvent) => {
+    if (e.touches.length < 2) this.pinch = 0;
   };
   private ro?: ResizeObserver;
   private bind() {
@@ -782,12 +1004,14 @@ export class CombRenderer {
     c.addEventListener('pointermove', this.onPointerMove);
     c.addEventListener('pointerdown', this.onPointerDown);
     c.addEventListener('pointerup', this.onPointerUp);
+    c.addEventListener('pointercancel', this.onPointerCancel);
     c.addEventListener('pointerleave', this.onPointerLeave);
     c.addEventListener('wheel', this.onWheel, { passive: false });
     c.addEventListener('touchstart', this.onTouchStart, { passive: true });
     c.addEventListener('touchmove', this.onTouchMove, { passive: false });
-    c.style.cursor = this.opts.mode === 'comb' ? 'grab' : 'default';
-    c.style.touchAction = this.opts.mode === 'comb' ? 'none' : 'auto';
+    c.addEventListener('touchend', this.onTouchEnd, { passive: true });
+    c.style.cursor = this.interactive() ? 'grab' : 'default';
+    c.style.touchAction = this.interactive() ? (this.opts.touchScroll ? 'pan-y' : 'none') : 'auto';
     this.ro = new ResizeObserver(() => this.resize());
     this.ro.observe(c);
   }
@@ -796,10 +1020,12 @@ export class CombRenderer {
     c.removeEventListener('pointermove', this.onPointerMove);
     c.removeEventListener('pointerdown', this.onPointerDown);
     c.removeEventListener('pointerup', this.onPointerUp);
+    c.removeEventListener('pointercancel', this.onPointerCancel);
     c.removeEventListener('pointerleave', this.onPointerLeave);
     c.removeEventListener('wheel', this.onWheel);
     c.removeEventListener('touchstart', this.onTouchStart);
     c.removeEventListener('touchmove', this.onTouchMove);
+    c.removeEventListener('touchend', this.onTouchEnd);
     this.ro?.disconnect();
   }
 
@@ -826,6 +1052,57 @@ export class CombRenderer {
     mesh.count = n;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  /** Advance one bee's wander / land / rest behaviour. Positions are relative to the cell centre. */
+  private stepBee(b: Bee, dt: number, t: number, active: boolean, canRest: boolean, radius: number) {
+    if (b.mode === 'rest' && (t > b.restUntil || b.leaving)) {
+      b.mode = 'fly';
+      b.nextTarget = 0;
+      b.toRest = false;
+    }
+    if (b.mode !== 'fly') return;
+    if (t > b.nextTarget && !b.leaving) {
+      const a = Math.random() * Math.PI * 2;
+      if (canRest && Math.random() < 0.16) {
+        b.tx = Math.cos(a) * 0.92;
+        b.tz = Math.sin(a) * 0.92;
+        b.toRest = true;
+      } else {
+        const r = Math.sqrt(Math.random()) * radius;
+        b.tx = Math.cos(a) * r;
+        b.tz = Math.sin(a) * r;
+        b.toRest = false;
+      }
+      b.nextTarget = t + 0.9 + Math.random() * 2.2;
+    }
+    const dx = b.tx - b.x;
+    const dz = b.tz - b.z;
+    const d = Math.hypot(dx, dz);
+    if (d < 0.05 && !b.leaving) {
+      if (b.toRest) {
+        b.mode = 'rest';
+        b.restUntil = t + 1.5 + Math.random() * 3;
+        b.vx = 0;
+        b.vz = 0;
+        b.heading = Math.atan2(-b.x, -b.z);
+        return;
+      }
+      b.nextTarget = Math.min(b.nextTarget, t + 0.2);
+    }
+    const sp = b.speed * (active ? 1 : 0.45);
+    const dvx = d > 0.001 ? (dx / d) * sp : 0;
+    const dvz = d > 0.001 ? (dz / d) * sp : 0;
+    const ka = Math.min(1, dt * 3.2);
+    b.vx += (dvx - b.vx) * ka;
+    b.vz += (dvz - b.vz) * ka;
+    b.x += b.vx * dt;
+    b.z += b.vz * dt;
+    if (Math.hypot(b.vx, b.vz) > 0.05) {
+      let diff = Math.atan2(b.vx, b.vz) - b.heading;
+      diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+      b.heading += diff * Math.min(1, dt * 7);
+    }
   }
 
   /**
@@ -876,21 +1153,23 @@ export class CombRenderer {
     }
     this.updateCamera();
 
-    // hover
-    if (this.opts.mode === 'comb' && this.opts.interactive !== false && !this.dragging) {
-      this.raycaster.setFromCamera(this.pointer, this.camera);
-      const hit = this.raycaster.intersectObject(this.wallMesh, false)[0] ?? this.raycaster.intersectObject(this.liquidMesh, false)[0];
-      const cell = hit && hit.instanceId !== undefined ? this.cells[hit.instanceId] : null;
-      if (cell !== this.hovered) {
-        if (this.hovered) this.hovered.targetLift = 0;
-        this.hovered = cell ?? null;
-        if (cell) cell.targetLift = 1;
-        this.canvas.style.cursor = cell ? 'pointer' : 'grab';
-        this.opts.onHover?.(cell ? cell.ca : null, this.lastPointer.x, this.lastPointer.y);
-      } else if (cell) {
-        this.opts.onHover?.(cell.ca, this.lastPointer.x, this.lastPointer.y);
+    // hover: re-pick when the pointer moved, and every few frames (cells lift and move)
+    this.frame++;
+    if (this.interactive() && this.pointerInside && !this.down?.moved && (this.pointerDirty || this.frame % 6 === 0)) {
+      this.pointerDirty = false;
+      const p = this.pickNdc(this.pointer);
+      if (pickKey(p) !== pickKey(this.hoverPick)) {
+        this.hoverPick = p;
+        this.canvas.style.cursor = p ? 'pointer' : 'grab';
+        this.opts.onHover?.(p);
       }
     }
+    const selCa = this.selPick?.kind === 'hive' ? this.selPick.ca : null;
+    const selSlot = this.selPick?.kind === 'empty' ? `${this.selPick.q},${this.selPick.r}` : null;
+    const hoverCa = this.hoverPick?.kind === 'hive' ? this.hoverPick.ca : null;
+    const hoverSlot = this.hoverPick?.kind === 'empty' ? `${this.hoverPick.q},${this.hoverPick.r}` : null;
+    let ringOn = false;
+    let ringScale = 1;
 
     // viscous easing: exponential approach, ~700 ms to settle
     const k = 1 - Math.exp(-dt * 4.2);
@@ -905,7 +1184,7 @@ export class CombRenderer {
       c.height += (c.targetHeight - c.height) * k;
       c.fill += (c.targetFill - c.fill) * k;
       c.cap += (c.targetCap - c.cap) * k;
-      c.lift += (c.targetLift - c.lift) * k;
+      c.lift += ((c.ca === selCa ? 1.8 : c.ca === hoverCa ? 1 : 0) - c.lift) * k;
       c.wall.lerp(c.targetWall, kSlow);
       c.liquid.lerp(c.targetLiquid, kSlow);
       c.flash = Math.max(0, c.flash - dt * 0.7);
@@ -933,6 +1212,12 @@ export class CombRenderer {
       const y = lift;
       const h = c.height * (1 - 0.1 * Math.sin(c.dip * Math.PI)) * grow;
       const pulseGlow = c.pulse > 0 && c.pulse < 1 ? Math.sin(c.pulse * Math.PI) : 0;
+      if (c.ca === selCa) {
+        ringOn = true;
+        ringScale = Math.max(0.001, grow);
+        this.selRing.position.set(c.pos.x, y + h - 0.01, c.pos.z);
+        this.selRing.material.color.copy(c.isBig ? this.palette.royal : this.palette.soft);
+      }
 
       // wall
       _q.identity();
@@ -990,57 +1275,7 @@ export class CombRenderer {
         const age = t - b.born;
         if (age < 1) scale *= 0.2 + 0.8 * age;
 
-        if (b.mode === 'rest') {
-          if (t > b.restUntil || b.leaving) {
-            b.mode = 'fly';
-            b.nextTarget = 0;
-            b.toRest = false;
-          }
-        }
-        if (b.mode === 'fly') {
-          if (t > b.nextTarget && !b.leaving) {
-            if (c.state === 'working' && Math.random() < 0.16) {
-              const a = Math.random() * Math.PI * 2;
-              b.tx = Math.cos(a) * 0.92;
-              b.tz = Math.sin(a) * 0.92;
-              b.toRest = true;
-            } else {
-              const a = Math.random() * Math.PI * 2;
-              const r = Math.sqrt(Math.random()) * 0.82;
-              b.tx = Math.cos(a) * r;
-              b.tz = Math.sin(a) * r;
-              b.toRest = false;
-            }
-            b.nextTarget = t + 0.9 + Math.random() * 2.2;
-          }
-          const dx = b.tx - b.x;
-          const dz = b.tz - b.z;
-          const d = Math.hypot(dx, dz);
-          if (d < 0.05 && !b.leaving) {
-            if (b.toRest) {
-              b.mode = 'rest';
-              b.restUntil = t + 1.5 + Math.random() * 3;
-              b.vx = 0;
-              b.vz = 0;
-              b.heading = Math.atan2(-b.x, -b.z);
-            } else b.nextTarget = Math.min(b.nextTarget, t + 0.2);
-          }
-          const sp = b.speed * (c.state === 'working' ? 1 : 0.45);
-          const dvx = d > 0.001 ? (dx / d) * sp : 0;
-          const dvz = d > 0.001 ? (dz / d) * sp : 0;
-          const ka = Math.min(1, dt * 3.2);
-          b.vx += (dvx - b.vx) * ka;
-          b.vz += (dvz - b.vz) * ka;
-          b.x += b.vx * dt;
-          b.z += b.vz * dt;
-          const v = Math.hypot(b.vx, b.vz);
-          if (v > 0.05) {
-            const want = Math.atan2(b.vx, b.vz);
-            let diff = want - b.heading;
-            diff = Math.atan2(Math.sin(diff), Math.cos(diff));
-            b.heading += diff * Math.min(1, dt * 7);
-          }
-        }
+        this.stepBee(b, dt, t, c.state === 'working', c.state === 'working', 0.82);
 
         let bx = c.pos.x + b.x;
         let bz = c.pos.z + b.z;
@@ -1089,9 +1324,94 @@ export class CombRenderer {
           if (u >= 1) q.arrive = -1;
         }
         const heading = Math.atan2(-Math.sin(q.a), Math.cos(q.a));
-        const tint = c.state !== 'working' ? this.palette.greyBee : c.isBig ? this.palette.royalQueen : this.palette.queen;
-        this.writeBee(qx, qy, qz, heading, 0.05, 0, qs, 1, tint, surfaceY, t, q.phase);
+        const look = c.hive.look;
+        if (look && c.state === 'working') {
+          let m = this.customQueens.get(c.ca);
+          if (!m) {
+            m = new QueenModel(look, { glowSize: 0.6 });
+            this.customQueens.set(c.ca, m);
+            this.scene.add(m.group);
+          }
+          m.setLook(look);
+          m.group.visible = true;
+          m.group.position.set(qx, qy, qz);
+          m.group.rotation.set(0.05, heading, 0);
+          m.group.scale.setScalar(qs * 1.3);
+          m.animate(t, q.phase);
+        } else {
+          const tint = c.state !== 'working' ? this.palette.greyBee : c.isBig ? this.palette.royalQueen : this.palette.queen;
+          this.writeBee(qx, qy, qz, heading, 0.05, 0, qs, 1, tint, surfaceY, t, q.phase);
+          const m = this.customQueens.get(c.ca);
+          if (m) m.group.visible = false;
+        }
+      } else if (this.customQueens.has(c.ca)) {
+        this.customQueens.get(c.ca)!.group.visible = false;
       }
+    }
+
+    // empty cells (the comb's edge)
+    const plateBase = this.day ? _c.set(theme.palette.dayBase).multiplyScalar(0.84).clone() : new THREE.Color(theme.palette.surface).lerp(this.palette.accent, 0.1);
+    const plateHot = this.day ? this.palette.soft.clone().lerp(new THREE.Color(theme.palette.dayBase), 0.35) : this.palette.accent.clone().multiplyScalar(0.42);
+    const rimBase = this.palette.accent.clone().multiplyScalar(this.day ? 0.6 : 0.3);
+    const rimHot = this.day ? this.palette.accent : this.palette.soft;
+    let ghostN = 0;
+    const nSlots = Math.min(this.slots.length, MAX_SLOTS);
+    for (let i = 0; i < nSlots; i++) {
+      const sl = this.slots[i];
+      const isSel = sl.key === selSlot;
+      sl.hover += ((sl.key === hoverSlot ? 1 : 0) - sl.hover) * k;
+      sl.sel += ((isSel ? 1 : 0) - sl.sel) * k;
+      const grow = smooth(0, 0.9, t - sl.born) * (1 - smooth(-0.2, 0.2, -1)); // fade in when the edge grows
+      const amt = Math.max(sl.hover, sl.sel);
+      const g = Math.max(0.001, grow);
+      _q.identity();
+      _p.set(sl.pos.x, 0, sl.pos.z);
+      _s.set(0.97 * g, 0.025 + amt * 0.02, 0.97 * g);
+      _m.compose(_p, _q, _s);
+      this.slotPlate.setMatrixAt(i, _m);
+      _c.copy(plateBase).lerp(plateHot, amt);
+      this.slotPlate.setColorAt(i, _c);
+      _s.set(g, 0.06 + amt * 0.05, g);
+      _m.compose(_p, _q, _s);
+      this.slotRim.setMatrixAt(i, _m);
+      _c.copy(rimBase).lerp(rimHot, Math.min(1, amt + (isSel ? 0.25 * Math.sin(t * 3.2) : 0)));
+      this.slotRim.setColorAt(i, _c);
+      // ghost cell: a translucent wax preview of the hive that could live here
+      const gh = 0.06 + 0.5 * amt + (isSel ? Math.sin(t * 2.4) * 0.03 : 0);
+      if (amt > 0.02 && ghostN < MAX_GHOSTS) {
+        _s.set(g * (0.92 + 0.08 * amt), gh, g * (0.92 + 0.08 * amt));
+        _m.compose(_p, _q, _s);
+        this.ghostMesh.setMatrixAt(ghostN++, _m);
+      }
+      if (isSel) {
+        ringOn = true;
+        ringScale = g;
+        this.selRing.position.set(sl.pos.x, gh - 0.01, sl.pos.z);
+        this.selRing.material.color.copy(this.palette.soft);
+        // scouts: three bees checking out the empty cell
+        for (const b of this.scouts) {
+          this.stepBee(b, dt, t, true, false, 0.6);
+          const by = gh + 0.28 + b.h * 0.6 + Math.sin(t * 3.1 + b.phase) * 0.045;
+          this.writeBee(sl.pos.x + b.x, by, sl.pos.z + b.z, b.heading, Math.min(0.35, Math.hypot(b.vx, b.vz) * 0.3), Math.sin(t * 2.2 + b.phase) * 0.08, b.scale * Math.min(1, (t - b.born) * 1.5), 1, this.palette.worker, gh, t, b.phase);
+        }
+      }
+    }
+    this.slotPlate.count = nSlots;
+    this.slotRim.count = nSlots;
+    this.ghostMesh.count = ghostN;
+    this.slotPlate.instanceMatrix.needsUpdate = true;
+    this.slotRim.instanceMatrix.needsUpdate = true;
+    this.ghostMesh.instanceMatrix.needsUpdate = true;
+    if (this.slotPlate.instanceColor) this.slotPlate.instanceColor.needsUpdate = true;
+    if (this.slotRim.instanceColor) this.slotRim.instanceColor.needsUpdate = true;
+    this.slotPlate.computeBoundingSphere();
+
+    // selection rim
+    this.selRing.visible = ringOn;
+    if (ringOn) {
+      const pulse = 1 + Math.sin(t * 3.2) * 0.015;
+      this.selRing.scale.set(ringScale * pulse, 0.06, ringScale * pulse);
+      this.selRing.material.opacity = 0.5 + 0.3 * Math.sin(t * 3.2);
     }
 
     // flights (swarms + founding colonies)
@@ -1146,6 +1466,9 @@ export class CombRenderer {
     this.capMesh.instanceMatrix.needsUpdate = true;
     if (this.wallMesh.instanceColor) this.wallMesh.instanceColor.needsUpdate = true;
     if (this.liquidMesh.instanceColor) this.liquidMesh.instanceColor.needsUpdate = true;
+    // keep the instanced bounding spheres current so ray picking reaches every cell
+    this.wallMesh.computeBoundingSphere();
+    this.liquidMesh.computeBoundingSphere();
     this.beeMesh.count = this.beeIdx;
     this.wingMesh.count = this.beeIdx;
     this.shadowMesh.count = this.beeIdx;

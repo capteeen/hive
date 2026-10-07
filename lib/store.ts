@@ -1,7 +1,8 @@
 'use client';
 import { create } from 'zustand';
-import { createWorld, createClock, stepWorld, foundHive, computeStats, SEED, type SimClock } from './sim';
+import { createWorld, createClock, stepWorld, foundHive, computeStats, SEED, type SimClock, type FoundInput } from './sim';
 import type { World, Hive, Action, Harvest, SceneEvent, Stats } from './types';
+import { setSfxEnabled } from './sfx';
 
 interface Position {
   ca: string;
@@ -15,6 +16,8 @@ interface HiveStore {
   stats: Stats;
   mode: 'night' | 'day';
   sound: boolean;
+  /** UI click sounds (on by default, persisted). */
+  sfx: boolean;
   /** CAs founded by the connected wallet in this session (mock). */
   mine: string[];
   /** Mock holdings for /me. */
@@ -22,10 +25,11 @@ interface HiveStore {
   claimed: string[];
   started: boolean;
   start: () => void;
-  found: (input: { name: string; ticker: string; image: string; description?: string; devBuy: number }) => Hive;
+  found: (input: FoundInput) => Hive;
   claim: (ca: string) => void;
   toggleMode: () => void;
   toggleSound: () => void;
+  toggleSfx: () => void;
   consumeEvents: (afterId: number) => SceneEvent[];
 }
 
@@ -41,6 +45,7 @@ export const useHive = create<HiveStore>((set, get) => ({
   stats: computeStats(initialWorld),
   mode: 'night',
   sound: false,
+  sfx: true,
   mine: [],
   positions: [],
   claimed: [],
@@ -68,6 +73,11 @@ export const useHive = create<HiveStore>((set, get) => ({
     try {
       const m = localStorage.getItem('hive:mode');
       if (m === 'day' || m === 'night') set({ mode: m });
+      const fx = localStorage.getItem('hive:sfx');
+      if (fx === '0') {
+        set({ sfx: false });
+        setSfxEnabled(false);
+      }
     } catch {}
   },
   found: (input) => {
@@ -85,6 +95,14 @@ export const useHive = create<HiveStore>((set, get) => ({
     } catch {}
   },
   toggleSound: () => set({ sound: !get().sound }),
+  toggleSfx: () => {
+    const on = !get().sfx;
+    set({ sfx: on });
+    setSfxEnabled(on);
+    try {
+      localStorage.setItem('hive:sfx', on ? '1' : '0');
+    } catch {}
+  },
   consumeEvents: (afterId) => get().world.events.filter((e) => e.id > afterId),
 }));
 
