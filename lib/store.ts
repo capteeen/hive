@@ -88,6 +88,8 @@ export const useHive = create<HiveStore>((set, get) => ({
   consumeEvents: (afterId) => get().world.events.filter((e) => e.id > afterId),
 }));
 
+if (typeof window !== 'undefined') (window as unknown as { __hive?: typeof useHive }).__hive = useHive;
+
 export function stopSim() {
   if (timer) clearInterval(timer);
   timer = null;

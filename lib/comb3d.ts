@@ -15,22 +15,38 @@ import { axialToXY, ringXY, spiral, cellKey } from './hex';
 import type { Hive, SceneEvent } from './types';
 
 const MAX_CELLS = 400;
-const MAX_BEES = 2600;
+const MAX_BEES = 3200;
 const MAX_RINGS = 96;
 const MAX_BEES_PER_CELL = 30;
 const TILT = (30 * Math.PI) / 180; // from vertical
 const CELL_R = 1;
 const CELL_GAP = 1.08; // spacing multiplier
 
+/** One worker bee hovering over its own cell. Positions are relative to the cell centre. */
 interface Bee {
-  a: number;
-  r: number;
-  h: number;
-  speed: number;
+  x: number;
+  z: number;
+  h: number; // preferred hover height above the rim
+  vx: number;
+  vz: number;
+  tx: number;
+  tz: number;
+  nextTarget: number;
+  mode: 'fly' | 'rest';
+  toRest: boolean; // current target is a landing spot on the rim
+  restUntil: number;
+  heading: number;
   phase: number;
   scale: number;
+  speed: number;
   leaving: number; // 0 = no, else time started
   born: number;
+}
+
+interface Queen {
+  a: number;
+  phase: number;
+  arrive: number; // time she descends into the cell (-1 = always been here)
 }
 
 interface Flight {
@@ -40,6 +56,7 @@ interface Flight {
   dur: number;
   bees: { dx: number; dz: number; dy: number; phase: number }[];
   targetCa: string;
+  kind: 'swarm' | 'found';
   done: boolean;
 }
 
@@ -75,10 +92,13 @@ interface CellVis {
   pulse: number; // harvest wave glow
   dip: number; // seal depth dip
   bees: Bee[];
+  queen: Queen;
   targetBees: number;
   nextLeave: number;
   state: Hive['state'];
-  spawn: number; // 1 → 0 grow-in
+  bornT: number; // time the founding sequence started (-1 = none)
+  foundedFx: boolean;
+  isBig: boolean;
   hive: Hive;
 }
 
@@ -95,7 +115,12 @@ const _q = new THREE.Quaternion();
 const _s = new THREE.Vector3();
 const _e = new THREE.Euler();
 const _c = new THREE.Color();
-const _dummy = new THREE.Object3D();
+const _v = new THREE.Vector3();
+
+const smooth = (a: number, b: number, x: number) => {
+  const u = THREE.MathUtils.clamp((x - a) / (b - a), 0, 1);
+  return u * u * (3 - 2 * u);
+};
 
 function hexShape(r: number) {
   const s = new THREE.Shape();
@@ -109,6 +134,11 @@ function hexShape(r: number) {
   s.closePath();
   return s;
 }
+function circleShape(r: number) {
+  const s = new THREE.Shape();
+  s.absarc(0, 0, r, 0, Math.PI * 2, false);
+  return s;
+}
 
 /** Hex prism along +Y from 0..1 (scaled later). */
 function prismGeometry(r: number, hole?: number) {
@@ -118,30 +148,76 @@ function prismGeometry(r: number, hole?: number) {
   g.rotateX(-Math.PI / 2);
   return g;
 }
-function circleShape(r: number) {
-  const s = new THREE.Shape();
-  s.absarc(0, 0, r, 0, Math.PI * 2, false);
-  return s;
+
+/* ---------- the bee ---------- */
+function paint(g: THREE.BufferGeometry, fn: (x: number, y: number, z: number) => THREE.Color) {
+  const pos = g.attributes.position;
+  const arr = new Float32Array(pos.count * 3);
+  for (let i = 0; i < pos.count; i++) {
+    const c = fn(pos.getX(i), pos.getY(i), pos.getZ(i));
+    arr[i * 3] = c.r;
+    arr[i * 3 + 1] = c.g;
+    arr[i * 3 + 2] = c.b;
+  }
+  g.setAttribute('color', new THREE.BufferAttribute(arr, 3));
+  g.deleteAttribute('uv');
+  return g;
 }
 
+/** Striped abdomen, fuzzy golden thorax, dark head. Forward is +Z. Length ≈ 0.31 units. */
 function beeGeometry() {
-  const body = new THREE.SphereGeometry(1, 10, 8);
-  body.scale(0.085, 0.07, 0.12);
-  const head = new THREE.SphereGeometry(1, 8, 6);
-  head.scale(0.048, 0.048, 0.048);
-  head.translate(0, 0.016, 0.13);
-  return mergeGeometries([body, head])!;
+  const dark = new THREE.Color('#1c1207');
+  const amber = new THREE.Color(theme.palette.accent);
+  const gold = new THREE.Color(theme.palette.accentSoft);
+  const fuzz = gold.clone().lerp(dark, 0.15);
+
+  const abdomen = new THREE.SphereGeometry(1, 16, 12);
+  paint(abdomen, (_x, y, z) => {
+    const s = (z + 1) / 2; // 0 = tail, 1 = front
+    if (s < 0.14) return dark;
+    const band = Math.floor(s * 5.4) % 2 === 0;
+    const c = (band ? dark : amber).clone();
+    if (y > 0.3) c.lerp(gold, band ? 0.1 : 0.25); // lit top
+    return c;
+  });
+  abdomen.scale(0.072, 0.064, 0.105);
+  abdomen.translate(0, 0, -0.058);
+
+  const thorax = new THREE.SphereGeometry(1, 14, 10);
+  paint(thorax, (_x, y) => (y > 0.2 ? gold.clone().lerp(new THREE.Color('#ffffff'), 0.12) : fuzz));
+  thorax.scale(0.064, 0.06, 0.072);
+  thorax.translate(0, 0.004, 0.052);
+
+  const head = new THREE.SphereGeometry(1, 12, 8);
+  paint(head, () => dark);
+  head.scale(0.04, 0.04, 0.038);
+  head.translate(0, 0.012, 0.118);
+
+  return mergeGeometries([abdomen, thorax, head])!;
 }
+
+/** Four translucent wings: fore + hind on each side, swept back, lying nearly flat. */
 function wingGeometry() {
-  const l = new THREE.PlaneGeometry(0.09, 0.17);
-  l.rotateX(-Math.PI / 2);
-  l.rotateZ(0.5);
-  l.translate(-0.065, 0.06, 0);
-  const r = new THREE.PlaneGeometry(0.09, 0.17);
-  r.rotateX(-Math.PI / 2);
-  r.rotateZ(-0.5);
-  r.translate(0.065, 0.06, 0);
-  return mergeGeometries([l, r])!;
+  const mk = (side: number, len: number, wid: number, dx: number, dz: number, sweep: number) => {
+    const g = new THREE.CircleGeometry(1, 12);
+    g.scale(len, wid, 1);
+    g.translate(len * 0.85, 0, 0); // hinge at the body
+    g.rotateX(-Math.PI / 2);
+    g.rotateY(-side * sweep);
+    if (side < 0) g.scale(-1, 1, 1);
+    g.translate(0, 0.056, dz + dx * 0);
+    return g;
+  };
+  const parts = [mk(1, 0.125, 0.048, 0, 0.012, 0.5), mk(-1, 0.125, 0.048, 0, 0.012, 0.5), mk(1, 0.085, 0.034, 0, -0.03, 0.95), mk(-1, 0.085, 0.034, 0, -0.03, 0.95)];
+  for (const p of parts) p.deleteAttribute('uv');
+  return mergeGeometries(parts)!;
+}
+
+function shadowGeometry() {
+  const g = new THREE.CircleGeometry(0.11, 12);
+  g.rotateX(-Math.PI / 2);
+  g.deleteAttribute('uv');
+  return g;
 }
 
 const spiralIndex = new Map<string, number>();
@@ -157,6 +233,8 @@ function layoutXZ(h: Hive): [number, number] {
   return [x, y];
 }
 
+const beeCount = (h: Hive, cap = MAX_BEES_PER_CELL) => (h.state === 'abandoned' ? 0 : Math.max(1, Math.min(cap, Math.round(h.bees / 90))));
+
 export class CombRenderer {
   private renderer: THREE.WebGLRenderer;
   private scene = new THREE.Scene();
@@ -171,13 +249,17 @@ export class CombRenderer {
   private capMesh: THREE.InstancedMesh;
   private beeMesh: THREE.InstancedMesh;
   private wingMesh: THREE.InstancedMesh;
+  private shadowMesh: THREE.InstancedMesh;
   private ringMesh: THREE.InstancedMesh;
   private pulseMesh: THREE.InstancedMesh;
   private rings: Ring[] = [];
   private pulses: Ring[] = [];
   private flights: Flight[] = [];
   private target = new THREE.Vector3();
+  private goal = new THREE.Vector3();
   private zoom = 1;
+  private zoomGoal = 1;
+  private flying = false;
   private azimuth = 0;
   private raf = 0;
   private last = 0;
@@ -192,6 +274,7 @@ export class CombRenderer {
   private width = 1;
   private height = 1;
   private maxHoney = 1;
+  private beeIdx = 0;
   private palette = {
     accent: new THREE.Color(theme.palette.accent),
     soft: new THREE.Color(theme.palette.accentSoft),
@@ -202,6 +285,10 @@ export class CombRenderer {
     greyWall: new THREE.Color(theme.palette.starving).multiplyScalar(0.55),
     deadWall: new THREE.Color(theme.palette.starving).multiplyScalar(0.3),
     deadLiquid: new THREE.Color(theme.palette.starving).multiplyScalar(0.45),
+    worker: new THREE.Color(1, 1, 1),
+    queen: new THREE.Color(1.25, 1.12, 0.92),
+    royalQueen: new THREE.Color(1.45, 1.4, 1.3),
+    greyBee: new THREE.Color(0.55, 0.55, 0.55),
   };
   private ground: THREE.Mesh<THREE.PlaneGeometry, THREE.MeshStandardMaterial>;
   private opts: CombOptions;
@@ -220,7 +307,8 @@ export class CombRenderer {
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
 
     this.camera = new THREE.OrthographicCamera(-10, 10, 10, -10, 0.1, 400);
-    this.zoom = opts.mode === 'single' ? 1.0 : 1;
+    this.zoom = 1;
+    this.zoomGoal = 1;
 
     this.scene.background = new THREE.Color(theme.palette.base);
 
@@ -282,16 +370,31 @@ export class CombRenderer {
     this.capMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.scene.add(this.capMesh);
 
-    const beeMat = new THREE.MeshStandardMaterial({ color: new THREE.Color(theme.palette.accent).multiplyScalar(0.75), roughness: 0.3, metalness: 0.2, emissive: new THREE.Color(theme.palette.accent), emissiveIntensity: 0.08 });
+    // bees: body with baked stripe colours, tinted per instance (queen / grey)
+    const beeMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.12 });
     this.beeMesh = new THREE.InstancedMesh(beeGeometry(), beeMat, MAX_BEES);
     this.beeMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.beeMesh.frustumCulled = false;
     this.scene.add(this.beeMesh);
-    const wingMat = new THREE.MeshBasicMaterial({ color: new THREE.Color(theme.palette.text), transparent: true, opacity: 0.2, side: THREE.DoubleSide, depthWrite: false });
+    const wingMat = new THREE.MeshPhysicalMaterial({
+      color: new THREE.Color(theme.palette.accentSoft).lerp(new THREE.Color('#ffffff'), 0.5),
+      transparent: true,
+      opacity: 0.28,
+      roughness: 0.15,
+      metalness: 0.2,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      toneMapped: true,
+    });
     this.wingMesh = new THREE.InstancedMesh(wingGeometry(), wingMat, MAX_BEES);
     this.wingMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.wingMesh.frustumCulled = false;
     this.scene.add(this.wingMesh);
+    const shadowMat = new THREE.MeshBasicMaterial({ color: 0x000000, transparent: true, opacity: 0.26, depthWrite: false });
+    this.shadowMesh = new THREE.InstancedMesh(shadowGeometry(), shadowMat, MAX_BEES);
+    this.shadowMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.shadowMesh.frustumCulled = false;
+    this.scene.add(this.shadowMesh);
 
     const ringGeo = new THREE.RingGeometry(0.86, 1, 48);
     ringGeo.rotateX(-Math.PI / 2);
@@ -314,7 +417,7 @@ export class CombRenderer {
     // post
     this.composer = new EffectComposer(this.renderer);
     this.composer.addPass(new RenderPass(this.scene, this.camera));
-    this.bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), this.isMobile ? 0.22 : 0.32, 0.55, 0.82);
+    this.bloom = new UnrealBloomPass(new THREE.Vector2(1, 1), this.isMobile ? 0.22 : 0.3, 0.55, 0.84);
     this.composer.addPass(this.bloom);
     this.composer.addPass(new OutputPass());
 
@@ -322,6 +425,7 @@ export class CombRenderer {
     this.resize();
     if (opts.mode === 'comb' && this.width > 1000) this.target.set(-3.2, 0, 0.4);
     else if (opts.mode === 'comb' && this.width < 760) this.target.set(0, 0, 5);
+    this.goal.copy(this.target);
     this.bind();
     this.last = performance.now();
     this.loop = this.loop.bind(this);
@@ -342,7 +446,7 @@ export class CombRenderer {
 
   /** Sync cells to the latest hive data. */
   sync(hives: Hive[], biggestCa: string) {
-    const list = this.opts.mode === 'single' ? hives : hives;
+    const list = hives;
     this.maxHoney = Math.max(1, ...list.map((h) => h.honey));
     const seen = new Set<string>();
     for (const h of list) {
@@ -360,8 +464,9 @@ export class CombRenderer {
       c.targetHeight = this.heightFor(h);
       c.targetFill = this.fillFor(h);
       c.targetCap = h.sealed;
-      c.targetBees = h.state === 'abandoned' ? 0 : Math.max(1, Math.min(MAX_BEES_PER_CELL, Math.round(h.bees / 60)));
+      c.targetBees = beeCount(h, this.opts.mode === 'single' ? 12 : MAX_BEES_PER_CELL);
       const isBig = h.ca === biggestCa && h.state !== 'abandoned';
+      c.isBig = isBig;
       if (h.state === 'abandoned') {
         c.targetWall.copy(this.palette.deadWall);
         c.targetLiquid.copy(this.palette.deadLiquid);
@@ -430,17 +535,55 @@ export class CombRenderer {
         }
         break;
       case 'spawn':
-        if (c) {
-          c.spawn = 1;
-          this.spawnRing(c.pos, 0.2, 2, 1.4, this.palette.soft, 0.1);
-        }
+        if (c) this.found(c);
         break;
     }
   }
 
-  focus(ca: string) {
+  /**
+   * The founding sequence for a new cell: the comb grows a cell at the edge (walls rise),
+   * honey pours in, the queen descends, and a stream of bees arrives from off-screen.
+   */
+  private found(c: CellVis) {
+    c.bornT = this.time;
+    c.foundedFx = false;
+    c.bees = [];
+    c.queen.arrive = this.time + 1.5;
+    c.pos.copy(c.target);
+    this.spawnRing(c.pos, 0.2, 2.4, 1.6, this.palette.soft, 0.08);
+    // bees arrive from outside the comb, along the outward direction of the cell
+    const dir = c.target.clone().setY(0);
+    if (dir.lengthSq() < 0.01) dir.set(1, 0, 0);
+    dir.normalize();
+    const from = c.target.clone().addScaledVector(dir, this.opts.mode === 'single' ? 4 : 13).setY(3);
+    const to = c.target.clone().setY(c.targetHeight + 0.35);
+    const bees: Flight['bees'] = [];
+    for (let i = 0; i < 16; i++) bees.push({ dx: (Math.random() - 0.5) * 0.6, dz: (Math.random() - 0.5) * 0.6, dy: Math.random() * 0.4, phase: Math.random() * 0.35 });
+    this.flights.push({ from, to, start: this.time + 0.6, dur: 2.6, bees, targetCa: c.ca, kind: 'found', done: false });
+  }
+
+  /** Smoothly pan and zoom the camera to a cell. */
+  flyTo(ca: string, zoom = 1.9) {
     const c = this.byCa.get(ca);
-    if (c) this.target.copy(c.target);
+    if (!c || this.opts.mode !== 'comb') return;
+    this.goal.copy(c.target);
+    // keep the cell clear of the side panel on wide screens
+    const halfW = (this.camera.right / zoom) * 1;
+    if (this.width > 1000) this.goal.x -= halfW * 0.28;
+    this.zoomGoal = zoom;
+    this.flying = true;
+  }
+
+  /** Screen position (px, relative to the canvas) of a cell's rim, or null if unknown. */
+  project(ca: string): { x: number; y: number } | null {
+    const c = this.byCa.get(ca);
+    if (!c) return null;
+    _v.set(c.pos.x, c.height + 0.35, c.pos.z).project(this.camera);
+    return { x: ((_v.x + 1) / 2) * this.width, y: ((1 - _v.y) / 2) * this.height };
+  }
+
+  focus(ca: string) {
+    this.flyTo(ca, this.zoom);
   }
 
   dispose() {
@@ -485,28 +628,42 @@ export class CombRenderer {
       pulse: 0,
       dip: 0,
       bees: [],
+      queen: { a: Math.random() * Math.PI * 2, phase: Math.random() * Math.PI * 2, arrive: -1 },
       targetBees: 0,
       nextLeave: 0,
       state: h.state,
-      spawn: 0,
+      bornT: -1,
+      foundedFx: true,
+      isBig: false,
       hive: h,
     };
-    const n = h.state === 'abandoned' ? 0 : Math.max(1, Math.min(MAX_BEES_PER_CELL, Math.round(h.bees / 60)));
-    for (let i = 0; i < n; i++) c.bees.push(this.makeBee());
+    const n = beeCount(h, this.opts.mode === 'single' ? 12 : MAX_BEES_PER_CELL);
+    for (let i = 0; i < n; i++) c.bees.push(this.makeBee(true));
     return c;
   }
 
-  private makeBee(): Bee {
-    const sz = this.opts.mode === 'single' ? 1.6 : 1;
+  private makeBee(settled = false): Bee {
+    const sz = this.opts.mode === 'single' ? 0.95 : 1;
+    const a = Math.random() * Math.PI * 2;
+    const r = Math.sqrt(Math.random()) * 0.8;
     return {
-      a: Math.random() * Math.PI * 2,
-      r: (0.15 + Math.random() * 0.75) * CELL_R * (this.opts.mode === 'single' ? 1.1 : 1),
-      h: Math.random() * 0.35,
-      speed: (0.6 + Math.random() * 1.2) * (Math.random() < 0.5 ? 1 : -1),
+      x: Math.cos(a) * r,
+      z: Math.sin(a) * r,
+      h: 0.08 + Math.random() * 0.35,
+      vx: 0,
+      vz: 0,
+      tx: Math.cos(a) * r,
+      tz: Math.sin(a) * r,
+      nextTarget: 0,
+      mode: 'fly',
+      toRest: false,
+      restUntil: 0,
+      heading: Math.random() * Math.PI * 2,
       phase: Math.random() * Math.PI * 2,
-      scale: (0.8 + Math.random() * 0.4) * sz,
+      scale: (0.85 + Math.random() * 0.3) * sz,
+      speed: 0.55 + Math.random() * 0.7,
       leaving: 0,
-      born: this.time,
+      born: settled ? this.time - 2 : this.time,
     };
   }
 
@@ -527,7 +684,7 @@ export class CombRenderer {
     const n = Math.min(26, 8 + Math.round(amount * 6));
     const bees: Flight['bees'] = [];
     for (let i = 0; i < n; i++) bees.push({ dx: (Math.random() - 0.5) * 0.5, dz: (Math.random() - 0.5) * 0.5, dy: Math.random() * 0.3, phase: Math.random() * 0.25 });
-    this.flights.push({ from: from.pos.clone().setY(from.height + 0.3), to: to.pos.clone().setY(to.height + 0.3), start: this.time, dur: 1.6 + Math.min(1.2, from.pos.distanceTo(to.pos) * 0.12), bees, targetCa: to.ca, done: false });
+    this.flights.push({ from: from.pos.clone().setY(from.height + 0.3), to: to.pos.clone().setY(to.height + 0.3), start: this.time, dur: 1.6 + Math.min(1.2, from.pos.distanceTo(to.pos) * 0.12), bees, targetCa: to.ca, kind: 'swarm', done: false });
     // some bees visibly leave the source
     let k = Math.min(from.bees.length - 1, 6);
     for (const b of from.bees) {
@@ -547,7 +704,7 @@ export class CombRenderer {
     this.renderer.setSize(w, h, false);
     this.composer.setSize(w, h);
     const aspect = w / h;
-    const view = this.opts.mode === 'single' ? 1.75 : this.width < 760 ? 15 : 12;
+    const view = this.opts.mode === 'single' ? 1.9 : this.width < 760 ? 15 : 12;
     this.camera.left = -view * aspect;
     this.camera.right = view * aspect;
     this.camera.top = view;
@@ -575,6 +732,7 @@ export class CombRenderer {
       const dx = e.movementX;
       const dy = e.movementY;
       if (Math.abs(dx) + Math.abs(dy) > 1) this.dragMoved = true;
+      this.flying = false;
       const unitsPerPx = (this.camera.right - this.camera.left) / this.zoom / this.width;
       const right = new THREE.Vector3(Math.cos(this.azimuth), 0, -Math.sin(this.azimuth));
       const up = new THREE.Vector3(-Math.sin(this.azimuth), 0, -Math.cos(this.azimuth));
@@ -600,10 +758,10 @@ export class CombRenderer {
   private onWheel = (e: WheelEvent) => {
     if (this.opts.mode !== 'comb' || this.opts.interactive === false) return;
     e.preventDefault();
+    this.flying = false;
     const f = Math.exp(-e.deltaY * 0.0012);
     this.zoom = THREE.MathUtils.clamp(this.zoom * f, 0.45, 4);
   };
-  private touches = new Map<number, { x: number; y: number }>();
   private onTouchStart = (e: TouchEvent) => {
     if (e.touches.length === 2) {
       this.pinch = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
@@ -612,6 +770,7 @@ export class CombRenderer {
   private onTouchMove = (e: TouchEvent) => {
     if (e.touches.length === 2 && this.pinch) {
       e.preventDefault();
+      this.flying = false;
       const d = Math.hypot(e.touches[0].clientX - e.touches[1].clientX, e.touches[0].clientY - e.touches[1].clientY);
       this.zoom = THREE.MathUtils.clamp(this.zoom * (d / this.pinch), 0.45, 4);
       this.pinch = d;
@@ -657,6 +816,7 @@ export class CombRenderer {
       const rad = r.from + (r.to - r.from) * ease;
       _p.set(r.pos.x, r.y + u * 0.05, r.pos.z);
       _s.set(rad, 1, rad);
+      _q.identity();
       _m.compose(_p, _q, _s);
       mesh.setMatrixAt(n, _m);
       _c.copy(r.color).multiplyScalar(1 - u);
@@ -666,6 +826,36 @@ export class CombRenderer {
     mesh.count = n;
     if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
     mesh.instanceMatrix.needsUpdate = true;
+  }
+
+  /**
+   * Write one bee instance: body, wings (flapping or folded) and a soft shadow on the
+   * surface below. `flap` 0 = wings folded (resting).
+   */
+  private writeBee(x: number, y: number, z: number, heading: number, pitch: number, roll: number, scale: number, flap: number, tint: THREE.Color, surfaceY: number, t: number, phase: number) {
+    const i = this.beeIdx;
+    if (i >= MAX_BEES) return;
+    _e.set(pitch, heading, roll);
+    _q.setFromEuler(_e);
+    _p.set(x, y, z);
+    _s.setScalar(scale);
+    _m.compose(_p, _q, _s);
+    this.beeMesh.setMatrixAt(i, _m);
+    this.beeMesh.setColorAt(i, tint);
+    // wings: fast flap blurs them; folded when resting
+    const f = flap > 0 ? 0.55 + Math.abs(Math.sin(t * 46 + phase)) * 0.75 : 0.35;
+    _s.set(scale * (flap > 0 ? 1 : 0.85), scale, scale * f);
+    _m.compose(_p, _q, _s);
+    this.wingMesh.setMatrixAt(i, _m);
+    // shadow
+    const alt = Math.max(0, y - surfaceY);
+    const sh = flap > 0 ? scale * Math.max(0.15, 1 - alt * 0.7) : 0.0001;
+    _p.set(x, surfaceY + 0.012, z);
+    _s.set(sh, 1, sh);
+    _q.identity();
+    _m.compose(_p, _q, _s);
+    this.shadowMesh.setMatrixAt(i, _m);
+    this.beeIdx++;
   }
 
   /* ---------- frame ---------- */
@@ -678,6 +868,12 @@ export class CombRenderer {
     if (!this.visible) return;
 
     if (this.opts.mode === 'single') this.azimuth += dt * 0.12;
+    if (this.flying) {
+      const kf = 1 - Math.exp(-dt * 2.2);
+      this.target.lerp(this.goal, kf);
+      this.zoom += (this.zoomGoal - this.zoom) * kf;
+      if (this.target.distanceTo(this.goal) < 0.02 && Math.abs(this.zoom - this.zoomGoal) < 0.005) this.flying = false;
+    }
     this.updateCamera();
 
     // hover
@@ -699,8 +895,9 @@ export class CombRenderer {
     // viscous easing: exponential approach, ~700 ms to settle
     const k = 1 - Math.exp(-dt * 4.2);
     const kSlow = 1 - Math.exp(-dt * 2.4);
-    let beeIdx = 0;
+    this.beeIdx = 0;
     const t = this.time;
+    const single = this.opts.mode === 'single';
 
     for (let i = 0; i < this.cells.length && i < MAX_CELLS; i++) {
       const c = this.cells[i];
@@ -715,17 +912,33 @@ export class CombRenderer {
       c.white = Math.max(0, c.white - dt * 0.9);
       c.pulse = Math.max(0, c.pulse - dt * 1.4);
       c.dip = Math.max(0, c.dip - dt * 1.1);
-      c.spawn = Math.max(0, c.spawn - dt * 0.8);
-      const grow = 1 - c.spawn * c.spawn;
+
+      // founding sequence: walls rise, then honey pours, then the colony arrives
+      let grow = 1;
+      let pour = 1;
+      let settled = true;
+      if (c.bornT >= 0) {
+        const age = t - c.bornT;
+        grow = smooth(0, 1.3, age);
+        pour = smooth(1.1, 2.8, age);
+        settled = age > 3.0;
+        if (!c.foundedFx && age > 3.2) {
+          c.foundedFx = true;
+          c.white = 0.9;
+          this.spawnRing(c.pos, 0.3, 1.5, 1.2, this.palette.royal, c.height + 0.05);
+        }
+        if (age > 6) c.bornT = -1;
+      }
       const lift = c.lift * 0.08;
       const y = lift;
       const h = c.height * (1 - 0.1 * Math.sin(c.dip * Math.PI)) * grow;
       const pulseGlow = c.pulse > 0 && c.pulse < 1 ? Math.sin(c.pulse * Math.PI) : 0;
 
       // wall
+      _q.identity();
       _p.set(c.pos.x, y, c.pos.z);
-      _s.set(grow, Math.max(0.02, h), grow);
-      _m.compose(_p, _q.identity(), _s);
+      _s.set(Math.max(0.001, grow), Math.max(0.02, h), Math.max(0.001, grow));
+      _m.compose(_p, _q, _s);
       this.wallMesh.setMatrixAt(i, _m);
       _c.copy(c.wall).lerp(this.palette.raid, c.flash * 0.8).lerp(this.palette.royal, Math.min(1, Math.min(1, c.white) * 0.8 + pulseGlow * 0.12));
       if (c.lift > 0) _c.lerp(this.palette.soft, c.lift * 0.25);
@@ -733,20 +946,21 @@ export class CombRenderer {
 
       // floor
       _p.set(c.pos.x, y, c.pos.z);
-      _s.set(grow, 0.08, grow);
+      _s.set(Math.max(0.001, grow), 0.08, Math.max(0.001, grow));
       _m.compose(_p, _q, _s);
       this.floorMesh.setMatrixAt(i, _m);
 
       // liquid
-      const level = Math.max(0.03, h * c.fill);
+      const level = Math.max(0.03, h * c.fill * pour);
       const wobble = c.state === 'working' ? 1 + Math.sin(t * 1.3 + i) * 0.004 : 1;
       _p.set(c.pos.x, y + 0.08, c.pos.z);
-      _s.set(0.995 * grow * wobble, level, 0.995 * grow * wobble);
+      _s.set(Math.max(0.001, 0.995 * grow * wobble), level, Math.max(0.001, 0.995 * grow * wobble));
       _m.compose(_p, _q, _s);
       this.liquidMesh.setMatrixAt(i, _m);
       _c.copy(c.liquid).lerp(this.palette.raid, c.flash).lerp(this.palette.royal, Math.min(1, c.white)).lerp(this.palette.soft, pulseGlow * 0.3);
       if (c.lift > 0) _c.lerp(this.palette.royal, c.lift * 0.15);
       this.liquidMesh.setColorAt(i, _c);
+      const surfaceY = y + 0.08 + level;
 
       // cap: a wax plate that closes the cell from the centre outward as supply is sealed
       const capF = Math.min(0.9, c.cap * 5) * grow;
@@ -755,89 +969,167 @@ export class CombRenderer {
       _m.compose(_p, _q, _s);
       this.capMesh.setMatrixAt(i, _m);
 
-      // bees: population management
+      /* ---- bees ---- */
+      const beeTint = c.state === 'working' ? this.palette.worker : this.palette.greyBee;
+      const rimY = y + h;
+      const hoverBase = rimY + 0.16;
+
+      // population management (new bees only once the colony has arrived)
       const alive = c.bees.filter((b) => !b.leaving).length;
-      if (alive < c.targetBees && Math.random() < dt * 3) c.bees.push(this.makeBee());
+      if (settled && alive < c.targetBees && Math.random() < dt * 3) c.bees.push(this.makeBee());
       if (alive > c.targetBees && t > c.nextLeave) {
         const b = c.bees.find((x) => !x.leaving);
         if (b) b.leaving = t;
         c.nextLeave = t + (c.state === 'working' ? 0.2 : 0.5);
       }
+
       for (let j = c.bees.length - 1; j >= 0; j--) {
         const b = c.bees[j];
-        if (beeIdx >= MAX_BEES) break;
-        b.a += b.speed * dt;
+        if (this.beeIdx >= MAX_BEES) break;
         let scale = b.scale;
-        let by = y + h + 0.22 + b.h + Math.sin(t * 2.6 + b.phase) * 0.06;
-        let bx = c.pos.x + Math.cos(b.a) * b.r;
-        let bz = c.pos.z + Math.sin(b.a) * b.r;
         const age = t - b.born;
-        if (age < 1) scale *= age;
+        if (age < 1) scale *= 0.2 + 0.8 * age;
+
+        if (b.mode === 'rest') {
+          if (t > b.restUntil || b.leaving) {
+            b.mode = 'fly';
+            b.nextTarget = 0;
+            b.toRest = false;
+          }
+        }
+        if (b.mode === 'fly') {
+          if (t > b.nextTarget && !b.leaving) {
+            if (c.state === 'working' && Math.random() < 0.16) {
+              const a = Math.random() * Math.PI * 2;
+              b.tx = Math.cos(a) * 0.92;
+              b.tz = Math.sin(a) * 0.92;
+              b.toRest = true;
+            } else {
+              const a = Math.random() * Math.PI * 2;
+              const r = Math.sqrt(Math.random()) * 0.82;
+              b.tx = Math.cos(a) * r;
+              b.tz = Math.sin(a) * r;
+              b.toRest = false;
+            }
+            b.nextTarget = t + 0.9 + Math.random() * 2.2;
+          }
+          const dx = b.tx - b.x;
+          const dz = b.tz - b.z;
+          const d = Math.hypot(dx, dz);
+          if (d < 0.05 && !b.leaving) {
+            if (b.toRest) {
+              b.mode = 'rest';
+              b.restUntil = t + 1.5 + Math.random() * 3;
+              b.vx = 0;
+              b.vz = 0;
+              b.heading = Math.atan2(-b.x, -b.z);
+            } else b.nextTarget = Math.min(b.nextTarget, t + 0.2);
+          }
+          const sp = b.speed * (c.state === 'working' ? 1 : 0.45);
+          const dvx = d > 0.001 ? (dx / d) * sp : 0;
+          const dvz = d > 0.001 ? (dz / d) * sp : 0;
+          const ka = Math.min(1, dt * 3.2);
+          b.vx += (dvx - b.vx) * ka;
+          b.vz += (dvz - b.vz) * ka;
+          b.x += b.vx * dt;
+          b.z += b.vz * dt;
+          const v = Math.hypot(b.vx, b.vz);
+          if (v > 0.05) {
+            const want = Math.atan2(b.vx, b.vz);
+            let diff = want - b.heading;
+            diff = Math.atan2(Math.sin(diff), Math.cos(diff));
+            b.heading += diff * Math.min(1, dt * 7);
+          }
+        }
+
+        let bx = c.pos.x + b.x;
+        let bz = c.pos.z + b.z;
+        let by: number;
+        let flap = 1;
+        let pitch = 0;
+        let roll = 0;
+        if (b.mode === 'rest') {
+          by = rimY + 0.012;
+          flap = 0;
+        } else {
+          by = hoverBase + b.h + Math.sin(t * 3.1 + b.phase) * 0.045;
+          const v = Math.hypot(b.vx, b.vz);
+          pitch = Math.min(0.35, v * 0.3);
+          roll = Math.sin(t * 2.2 + b.phase) * 0.08;
+        }
         if (b.leaving) {
           const lt = (t - b.leaving) / 1.8;
           if (lt >= 1) {
             c.bees.splice(j, 1);
             continue;
           }
-          by += lt * 2.2;
-          bx += Math.cos(b.phase) * lt * 1.5;
-          bz += Math.sin(b.phase) * lt * 1.5;
-          scale *= 1 - lt;
+          by += lt * lt * 2.6;
+          bx += Math.cos(b.phase) * lt * 1.4;
+          bz += Math.sin(b.phase) * lt * 1.4;
+          scale *= 1 - lt * 0.8;
+          flap = 1;
+          pitch = -0.4;
         }
-        const heading = -b.a + (b.speed > 0 ? Math.PI / 2 : -Math.PI / 2);
-        _e.set(0, heading, Math.sin(t * 4 + b.phase) * 0.15);
-        _q.setFromEuler(_e);
-        _p.set(bx, by, bz);
-        _s.setScalar(scale);
-        _m.compose(_p, _q, _s);
-        this.beeMesh.setMatrixAt(beeIdx, _m);
-        const flap = 0.6 + Math.abs(Math.sin(t * 40 + b.phase)) * 0.8;
-        _s.set(scale, scale, scale * flap);
-        _m.compose(_p, _q, _s);
-        this.wingMesh.setMatrixAt(beeIdx, _m);
-        beeIdx++;
+        this.writeBee(bx, by, bz, b.heading, pitch, roll, scale, flap, beeTint, surfaceY, t, b.phase);
+      }
+
+      // the queen: one per living cell, bigger, slow, near the centre; white for the biggest
+      if (c.state !== 'abandoned' && c.queen.arrive <= t && this.beeIdx < MAX_BEES) {
+        const q = c.queen;
+        q.a += dt * (c.state === 'working' ? 0.4 : 0.15);
+        const qr = single ? 0.3 : 0.2;
+        const qx = c.pos.x + Math.cos(q.a) * qr;
+        const qz = c.pos.z + Math.sin(q.a) * qr;
+        let qy = rimY + 0.36 + Math.sin(t * 1.6 + q.phase) * 0.04;
+        let qs = (single ? 1.7 : 1.75) * grow;
+        if (q.arrive >= 0) {
+          const u = smooth(0, 1.5, t - q.arrive);
+          qy += (1 - u) * 5;
+          qs *= 0.2 + 0.8 * u;
+          if (u >= 1) q.arrive = -1;
+        }
+        const heading = Math.atan2(-Math.sin(q.a), Math.cos(q.a));
+        const tint = c.state !== 'working' ? this.palette.greyBee : c.isBig ? this.palette.royalQueen : this.palette.queen;
+        this.writeBee(qx, qy, qz, heading, 0.05, 0, qs, 1, tint, surfaceY, t, q.phase);
       }
     }
-    _q.identity();
 
-    // flights (swarms)
+    // flights (swarms + founding colonies)
     for (const f of this.flights) {
       const u = (t - f.start) / f.dur;
+      if (u < 0) continue;
       if (u >= 1) {
         if (!f.done) {
           f.done = true;
           const target = this.byCa.get(f.targetCa);
           if (target) {
-            target.flash = 1.2;
-            this.spawnRing(target.pos, 0.3, 1.6, 1.1, this.palette.raid, target.height + 0.05);
+            if (f.kind === 'swarm') {
+              target.flash = 1.2;
+              this.spawnRing(target.pos, 0.3, 1.6, 1.1, this.palette.raid, target.height + 0.05);
+            } else {
+              this.spawnRing(target.pos, 0.3, 1.4, 1.0, this.palette.soft, target.height + 0.05);
+            }
           }
         }
         continue;
       }
+      const target = this.byCa.get(f.targetCa);
+      const surface = target ? target.height * target.fill + 0.08 : 0;
       const apex = 1.6 + f.from.distanceTo(f.to) * 0.25;
+      const dirx = f.to.x - f.from.x;
+      const dirz = f.to.z - f.from.z;
+      const heading = Math.atan2(dirx, dirz);
       for (const b of f.bees) {
-        if (beeIdx >= MAX_BEES) break;
+        if (this.beeIdx >= MAX_BEES) break;
         const uu = THREE.MathUtils.clamp(u - b.phase * 0.4, 0, 1);
+        if (uu <= 0 || uu >= 1) continue;
         const e = uu < 0.5 ? 2 * uu * uu : 1 - Math.pow(-2 * uu + 2, 2) / 2;
-        _p.lerpVectors(f.from, f.to, e);
-        _p.y += Math.sin(e * Math.PI) * apex + b.dy;
-        _p.x += b.dx;
-        _p.z += b.dz;
-        const dirx = f.to.x - f.from.x;
-        const dirz = f.to.z - f.from.z;
-        _e.set(-Math.cos(e * Math.PI) * 0.6, Math.atan2(dirx, dirz), 0);
-        _q.setFromEuler(_e);
-        _s.setScalar(uu > 0 && uu < 1 ? 1.05 : 0.0001);
-        _m.compose(_p, _q, _s);
-        this.beeMesh.setMatrixAt(beeIdx, _m);
-        _s.set(1.05, 1.05, 1.05 * (0.6 + Math.abs(Math.sin(t * 40 + b.phase * 10)) * 0.8));
-        _m.compose(_p, _q, _s);
-        this.wingMesh.setMatrixAt(beeIdx, _m);
-        beeIdx++;
+        _v.lerpVectors(f.from, f.to, e);
+        const yy = _v.y + Math.sin(e * Math.PI) * apex + b.dy;
+        this.writeBee(_v.x + b.dx, yy, _v.z + b.dz, heading, -Math.cos(e * Math.PI) * 0.5, Math.sin(t * 3 + b.phase * 20) * 0.1, 1.05, 1, this.palette.worker, surface, t, b.phase * 20);
       }
     }
     this.flights = this.flights.filter((f) => !f.done);
-    _q.identity();
 
     // rings + pulses
     this.drawRings(this.rings, this.ringMesh, t);
@@ -854,12 +1146,14 @@ export class CombRenderer {
     this.capMesh.instanceMatrix.needsUpdate = true;
     if (this.wallMesh.instanceColor) this.wallMesh.instanceColor.needsUpdate = true;
     if (this.liquidMesh.instanceColor) this.liquidMesh.instanceColor.needsUpdate = true;
-    this.beeMesh.count = beeIdx;
-    this.wingMesh.count = beeIdx;
+    this.beeMesh.count = this.beeIdx;
+    this.wingMesh.count = this.beeIdx;
+    this.shadowMesh.count = this.beeIdx;
     this.beeMesh.instanceMatrix.needsUpdate = true;
     this.wingMesh.instanceMatrix.needsUpdate = true;
+    this.shadowMesh.instanceMatrix.needsUpdate = true;
+    if (this.beeMesh.instanceColor) this.beeMesh.instanceColor.needsUpdate = true;
 
     this.composer.render();
   }
 }
-void _dummy;

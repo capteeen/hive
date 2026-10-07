@@ -77,7 +77,7 @@ export default function LaunchModal() {
       setTg('');
       setDevBuy('');
       setImage('');
-      router.push(`/hive/${h.ca}`);
+      router.push(`/comb?focus=${h.ca}`);
     } catch (e) {
       setErr((e as Error).message ?? 'Launch failed');
     } finally {

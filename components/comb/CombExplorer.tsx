@@ -2,7 +2,11 @@
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { useMemo, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { useHive, selectHives } from '@/lib/store';
+import { useNow } from '@/lib/useNow';
+import { short, addrUrl } from '@/lib/format';
+import HexButton from '@/components/HexButton';
 import { theme } from '@/themes';
 import { feeGrowth } from '@/lib/sim';
 import { fmtNum, fmtSol } from '@/lib/format';
@@ -22,6 +26,14 @@ export default function CombExplorer() {
   const [sort, setSort] = useState<Sort>('honey');
   const [q, setQ] = useState('');
   const [open, setOpen] = useState(true);
+  const params = useSearchParams();
+  const router = useRouter();
+  const focusCa = params.get('focus') ?? undefined;
+  const mine = useHive((s) => s.mine);
+  const focusHive = focusCa ? hives.find((h) => h.ca === focusCa) : undefined;
+  const [dismissed, setDismissed] = useState(false);
+  const now = useNow(1000);
+  const justFounded = !!focusHive && mine.includes(focusHive.ca) && now !== null && now - focusHive.bornAt < 120000;
 
   const filter = useMemo(() => {
     const query = q.trim().toLowerCase();
@@ -35,7 +47,12 @@ export default function CombExplorer() {
 
   return (
     <div className="relative h-[100svh] w-full overflow-hidden">
-      <CombScene className="absolute inset-0 h-full w-full" filter={filter} />
+      <CombScene
+        className="absolute inset-0 h-full w-full"
+        filter={filter}
+        focusCa={focusCa}
+        label={focusHive && !dismissed ? { ca: focusHive.ca, text: `${focusHive.name} · $${focusHive.ticker}` } : null}
+      />
       <div className="pointer-events-none absolute inset-x-0 top-0 h-28 bg-gradient-to-b from-night/80 to-transparent" />
       <div className="absolute left-4 top-24 z-10 flex max-h-[calc(100svh-7rem)] w-[min(380px,calc(100vw-2rem))] flex-col sm:left-6 sm:top-28">
         <div className="shape-card glass p-4">
@@ -87,6 +104,48 @@ export default function CombExplorer() {
           </ol>
         )}
       </div>
+      {focusHive && !dismissed && (
+        <div className="shape-card glass fade-up absolute bottom-6 left-4 right-4 z-10 p-5 sm:left-auto sm:right-6 sm:w-[380px]">
+          <div className="flex items-start gap-3">
+            <Avatar hive={focusHive} size={44} />
+            <div className="min-w-0 flex-1">
+              <div className="text-[11px] uppercase tracking-[0.18em] text-accent">{justFounded ? `your ${theme.unit} is on the ${theme.scene}` : `on the ${theme.scene}`}</div>
+              <div className="mt-0.5 truncate font-heading text-lg font-semibold tracking-tight">
+                {focusHive.name} <span className="text-accent">${focusHive.ticker}</span>
+              </div>
+              <div className="mt-1 text-xs text-text/60">
+                {justFounded
+                  ? `The ${theme.agent} has her wallet. ${cap(theme.holderPlural)} are moving in. From now on she ${theme.verbs.burn}s, ${theme.verbs.store.split(' ')[0]}s and ${theme.verbs.interact}s with the fees.`
+                  : `${fmtSol(focusHive.honey, 2)} · ${fmtNum(focusHive.bees)} ${theme.holderPlural} · ${focusHive.state}`}
+              </div>
+              <div className="mt-2 flex items-center gap-2 text-[11px] text-text/50">
+                <span>{theme.agent} wallet</span>
+                <a href={addrUrl(focusHive.queenWallet)} target="_blank" rel="noreferrer" className="font-mono text-accent/80 hover:text-accent">
+                  {short(focusHive.queenWallet, 5)} ↗
+                </a>
+              </div>
+            </div>
+            <button
+              onClick={() => {
+                setDismissed(true);
+                router.replace('/comb');
+              }}
+              className="shape-hex flex h-8 w-8 shrink-0 items-center justify-center bg-accent/10 text-text/70 hover:bg-accent/20"
+              aria-label="Dismiss"
+            >
+              ×
+            </button>
+          </div>
+          <div className="mt-4 flex gap-2">
+            <HexButton size="sm" href={`/hive/${focusHive.ca}`}>
+              Open {theme.unit}
+            </HexButton>
+            <HexButton size="sm" variant="ghost" href="/leaderboard">
+              Leaderboard
+            </HexButton>
+          </div>
+        </div>
+      )}
       <div className="pointer-events-none absolute bottom-6 right-6 hidden text-[11px] uppercase tracking-[0.18em] text-text/40 sm:block">{cap(theme.holderPlural)} capped at 30 per cell · hover for real count</div>
     </div>
   );
