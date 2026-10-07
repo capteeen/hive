@@ -43,6 +43,31 @@ export interface Chain {
   coinInfo(mint: string): Promise<{ priceSol: number; marketCapSol?: number; complete?: boolean } | null>;
   /** Holder count (needs HELIUS_API_KEY in live mode). Null when unknown. */
   holders(mint: string): Promise<{ count: number; top: { owner: string; amount: bigint }[] } | null>;
+  /**
+   * Whether an account exists on chain (confirmed). The launch flow uses it on the mint before
+   * re-sending a `create`, so a retry after a lost response never creates twice. Every chain that
+   * sends real transactions must implement it; optional only so older fakes keep compiling.
+   */
+  accountExists?(pubkey: string): Promise<boolean>;
+}
+
+/** Solana's base fee per signature. `transferSol` pays only this (no priority fee), so draining an account is exact. */
+export const BASE_FEE_LAMPORTS = 5000;
+
+/**
+ * A transaction that was signed (so its signature is known) but did not confirm cleanly.
+ * `landed`: true = it is on chain and failed; false = it can no longer land (blockhash expired);
+ * undefined = unknown (timed out while waiting). Callers record `signature` for later checks.
+ */
+export class TxError extends Error {
+  constructor(
+    message: string,
+    readonly signature?: string,
+    readonly landed?: boolean,
+  ) {
+    super(message);
+    this.name = 'TxError';
+  }
 }
 
 let instance: Promise<Chain> | null = null;
